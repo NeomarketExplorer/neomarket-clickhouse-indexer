@@ -1,0 +1,48 @@
+# Production compose for Coolify deployment.
+# NOTE: The ClickHouse container on Hetzner is managed by Coolify separately.
+# Port binding (127.0.0.1) and password changes must also be applied via Coolify UI.
+services:
+  indexer:
+    build: .
+    command: ["bash", "-lc", "npm run start"]
+    env_file: /opt/subsquid_poli/.env
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 4G
+    networks:
+      - subsquid_poli_default
+
+  api:
+    build: .
+    command: ["bash", "-lc", "npm run api"]
+    env_file: /opt/subsquid_poli/.env
+    ports:
+      - "3002:3002"
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 2G
+    networks:
+      - subsquid_poli_default
+
+  snapshotter:
+    build: .
+    command: ["bash", "-lc", "npm run snapshot:scheduler -- --wallets-file /app/wallets.txt --interval 1d --loop --sleep 3600"]
+    env_file: /opt/subsquid_poli/.env
+    restart: unless-stopped
+    profiles: ["worker"]
+    deploy:
+      resources:
+        limits:
+          memory: 4G
+    volumes:
+      - /opt/subsquid_poli/wallets.txt:/app/wallets.txt:ro
+    networks:
+      - subsquid_poli_default
+
+networks:
+  subsquid_poli_default:
+    external: true
