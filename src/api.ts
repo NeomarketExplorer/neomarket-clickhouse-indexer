@@ -169,8 +169,9 @@ async function handlePositions(url: URL, res: ServerResponse) {
     return
   }
 
-  // Get avg buy price per token from wallet_trades view
   const tokenIds = balances.map(b => b.token_id)
+
+  // Get avg buy price per token from wallet_trades view
   const priceResult = await client.query({
     query: `
       SELECT
@@ -188,13 +189,63 @@ async function handlePositions(url: URL, res: ServerResponse) {
   const prices = await priceResult.json() as Array<{ token_id: string; avg_price: number }>
   const priceMap = new Map(prices.map(p => [p.token_id, p.avg_price]))
 
-  const positions = balances.map(b => ({
-    asset: b.token_id,
-    condition_id: '',
-    outcome_index: 0,
-    size: Number(b.balance) / 1e6,
-    avg_price: priceMap.get(b.token_id) ?? 0,
-  }))
+  // Get market metadata: token_id → (condition_id, question, slug, outcome_index)
+  const metaResult = await client.query({
+    query: `
+      SELECT
+        condition_id,
+        question,
+        slug,
+        outcomes,
+        token_ids
+      FROM market_metadata FINAL
+      WHERE hasAny(token_ids, {tokenIds:Array(String)})
+    `,
+    query_params: { tokenIds },
+    format: 'JSONEachRow',
+  })
+  type MetaRow = {
+    condition_id: string
+    question: string
+    slug: string
+    outcomes: string[]
+    token_ids: string[]
+  }
+  const metaRows = await metaResult.json() as MetaRow[]
+
+  // Build token_id → metadata lookup
+  const tokenMeta = new Map<string, { condition_id: string; question: string; slug: string; outcome: string; outcome_index: number }>()
+  for (const m of metaRows) {
+    const tids = Array.isArray(m.token_ids) ? m.token_ids : []
+    const outs = Array.isArray(m.outcomes) ? m.outcomes : []
+    for (let i = 0; i < tids.length; i++) {
+      tokenMeta.set(tids[i], {
+        condition_id: m.condition_id,
+        question: m.question,
+        slug: m.slug,
+        outcome: outs[i] ?? `Outcome ${i}`,
+        outcome_index: i,
+      })
+    }
+  }
+
+  const positions = balances.map(b => {
+    const meta = tokenMeta.get(b.token_id)
+    const size = Number(b.balance) / 1e6
+    const avgPrice = priceMap.get(b.token_id) ?? 0
+    const initialValue = size * avgPrice
+    return {
+      asset: b.token_id,
+      condition_id: meta?.condition_id ?? '',
+      outcome: meta?.outcome ?? '',
+      outcome_index: meta?.outcome_index ?? 0,
+      question: meta?.question ?? '',
+      slug: meta?.slug ?? '',
+      size,
+      avg_price: avgPrice,
+      initial_value: initialValue,
+    }
+  })
 
   json(res, 200, positions)
 }
@@ -238,15 +289,43 @@ async function handleActivity(url: URL, res: ServerResponse) {
   }
   const rows = await result.json() as TradeRow[]
 
-  const activity = rows.map(r => ({
-    type: 'trade' as const,
-    timestamp: r.block_timestamp,
-    side: r.side.toUpperCase(),
-    price: r.price_per_token,
-    size: Number(r.token_amount) / 1e6,
-    value: Number(r.usdc_amount) / 1e6,
-    transaction_hash: r.id.split('-')[0] || '',
-  }))
+  // Enrich with market metadata
+  const activityTokenIds = [...new Set(rows.map(r => r.token_id))]
+  const actMetaResult = await client.query({
+    query: `
+      SELECT condition_id, question, slug, outcomes, token_ids
+      FROM market_metadata FINAL
+      WHERE hasAny(token_ids, {tokenIds:Array(String)})
+    `,
+    query_params: { tokenIds: activityTokenIds },
+    format: 'JSONEachRow',
+  })
+  type ActMetaRow = { condition_id: string; question: string; slug: string; outcomes: string[]; token_ids: string[] }
+  const actMeta = await actMetaResult.json() as ActMetaRow[]
+  const actTokenMeta = new Map<string, { condition_id: string; question: string; outcome: string }>()
+  for (const m of actMeta) {
+    const tids = Array.isArray(m.token_ids) ? m.token_ids : []
+    const outs = Array.isArray(m.outcomes) ? m.outcomes : []
+    for (let i = 0; i < tids.length; i++) {
+      actTokenMeta.set(tids[i], { condition_id: m.condition_id, question: m.question, outcome: outs[i] ?? '' })
+    }
+  }
+
+  const activity = rows.map(r => {
+    const meta = actTokenMeta.get(r.token_id)
+    return {
+      type: 'trade' as const,
+      timestamp: r.block_timestamp,
+      condition_id: meta?.condition_id ?? '',
+      question: meta?.question ?? '',
+      outcome: meta?.outcome ?? '',
+      side: r.side.toUpperCase(),
+      price: r.price_per_token,
+      size: Number(r.token_amount) / 1e6,
+      value: Number(r.usdc_amount) / 1e6,
+      transaction_hash: r.id.split('-')[0] || '',
+    }
+  })
 
   json(res, 200, activity)
 }
