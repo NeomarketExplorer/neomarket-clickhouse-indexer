@@ -1,5 +1,5 @@
 /**
- * Minimal API for frontend consumption.
+ * API for frontend consumption.
  *
  * Endpoints:
  *   GET /health
@@ -7,7 +7,12 @@
  *   GET /snapshots/:wallet?fromTs=&toTs=&limit=
  *   GET /ledger/:wallet?fromTs=&toTs=&limit=
  *   GET /positions?user=ADDRESS
- *   GET /activity?user=ADDRESS&limit=50
+ *   GET /activity?user=ADDRESS&limit=50&offset=0&type=all&conditionId=
+ *   GET /portfolio/history?user=ADDRESS&interval=1d&from=&to=
+ *   GET /user/stats?user=ADDRESS
+ *   GET /trades?tokenId=ID&limit=50&offset=0
+ *   GET /market/stats?conditionId=ID (or ?tokenId=ID)
+ *   GET /leaderboard?sort=pnl&limit=20&period=all
  */
 
 import { createServer, IncomingMessage, ServerResponse } from 'node:http'
@@ -18,6 +23,10 @@ const client = createClient({
   database: process.env.CLICKHOUSE_DATABASE || 'polymarket',
   username: process.env.CLICKHOUSE_USER || 'default',
   password: process.env.CLICKHOUSE_PASSWORD || '',
+  request_timeout: 300_000,
+  clickhouse_settings: {
+    max_execution_time: 300,
+  },
 })
 
 function isValidAddress(addr: string): boolean {
@@ -32,6 +41,62 @@ function json(res: ServerResponse, status: number, body: unknown) {
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type')
   res.end(JSON.stringify(body))
 }
+
+// ── Helpers ──────────────────────────────────────────────────────────
+
+type TokenMeta = {
+  condition_id: string
+  question: string
+  slug: string
+  outcome: string
+  outcome_index: number
+}
+
+async function getTokenMetaMap(tokenIds: string[]): Promise<Map<string, TokenMeta>> {
+  if (tokenIds.length === 0) return new Map()
+  const result = await client.query({
+    query: `
+      SELECT condition_id, question, slug, outcomes, token_ids
+      FROM market_metadata FINAL
+      WHERE hasAny(token_ids, {tokenIds:Array(String)})
+    `,
+    query_params: { tokenIds },
+    format: 'JSONEachRow',
+  })
+  type Row = { condition_id: string; question: string; slug: string; outcomes: string[]; token_ids: string[] }
+  const rows = await result.json() as Row[]
+  const map = new Map<string, TokenMeta>()
+  for (const m of rows) {
+    const tids = Array.isArray(m.token_ids) ? m.token_ids : []
+    const outs = Array.isArray(m.outcomes) ? m.outcomes : []
+    for (let i = 0; i < tids.length; i++) {
+      map.set(tids[i], {
+        condition_id: m.condition_id,
+        question: m.question,
+        slug: m.slug,
+        outcome: outs[i] ?? `Outcome ${i}`,
+        outcome_index: i,
+      })
+    }
+  }
+  return map
+}
+
+async function getTokenIdsForCondition(conditionId: string): Promise<string[]> {
+  const result = await client.query({
+    query: `SELECT token_ids FROM market_metadata FINAL WHERE condition_id = {cid:String} LIMIT 1`,
+    query_params: { cid: conditionId },
+    format: 'JSONEachRow',
+  })
+  const rows = await result.json() as Array<{ token_ids: string[] }>
+  return rows[0]?.token_ids ?? []
+}
+
+function round2(n: number): number {
+  return Math.round(n * 100) / 100
+}
+
+// ── Existing Handlers ───────────────────────────────────────────────
 
 async function querySnapshot(wallet: string, ts: number) {
   const result = await client.query({
@@ -150,7 +215,6 @@ async function handlePositions(url: URL, res: ServerResponse) {
   }
   const wallet = user.toLowerCase()
 
-  // Get token balances from SummingMergeTree (need to force merge with GROUP BY)
   const balanceResult = await client.query({
     query: `
       SELECT token_id, sum(balance) AS balance
@@ -171,7 +235,6 @@ async function handlePositions(url: URL, res: ServerResponse) {
 
   const tokenIds = balances.map(b => b.token_id)
 
-  // Get avg buy price per token from wallet_trades view
   const priceResult = await client.query({
     query: `
       SELECT
@@ -189,48 +252,10 @@ async function handlePositions(url: URL, res: ServerResponse) {
   const prices = await priceResult.json() as Array<{ token_id: string; avg_price: number }>
   const priceMap = new Map(prices.map(p => [p.token_id, p.avg_price]))
 
-  // Get market metadata: token_id → (condition_id, question, slug, outcome_index)
-  const metaResult = await client.query({
-    query: `
-      SELECT
-        condition_id,
-        question,
-        slug,
-        outcomes,
-        token_ids
-      FROM market_metadata FINAL
-      WHERE hasAny(token_ids, {tokenIds:Array(String)})
-    `,
-    query_params: { tokenIds },
-    format: 'JSONEachRow',
-  })
-  type MetaRow = {
-    condition_id: string
-    question: string
-    slug: string
-    outcomes: string[]
-    token_ids: string[]
-  }
-  const metaRows = await metaResult.json() as MetaRow[]
-
-  // Build token_id → metadata lookup
-  const tokenMeta = new Map<string, { condition_id: string; question: string; slug: string; outcome: string; outcome_index: number }>()
-  for (const m of metaRows) {
-    const tids = Array.isArray(m.token_ids) ? m.token_ids : []
-    const outs = Array.isArray(m.outcomes) ? m.outcomes : []
-    for (let i = 0; i < tids.length; i++) {
-      tokenMeta.set(tids[i], {
-        condition_id: m.condition_id,
-        question: m.question,
-        slug: m.slug,
-        outcome: outs[i] ?? `Outcome ${i}`,
-        outcome_index: i,
-      })
-    }
-  }
+  const metaMap = await getTokenMetaMap(tokenIds)
 
   const positions = balances.map(b => {
-    const meta = tokenMeta.get(b.token_id)
+    const meta = metaMap.get(b.token_id)
     const size = Number(b.balance) / 1e6
     const avgPrice = priceMap.get(b.token_id) ?? 0
     const initialValue = size * avgPrice
@@ -250,6 +275,8 @@ async function handlePositions(url: URL, res: ServerResponse) {
   json(res, 200, positions)
 }
 
+// ── NEW: Enhanced Activity ──────────────────────────────────────────
+
 async function handleActivity(url: URL, res: ServerResponse) {
   const user = url.searchParams.get('user')
   if (!user || !isValidAddress(user)) {
@@ -257,81 +284,502 @@ async function handleActivity(url: URL, res: ServerResponse) {
     return
   }
   const wallet = user.toLowerCase()
-  const limit = Math.min(Math.max(Number(url.searchParams.get('limit') || 50), 1), 500)
+  const limit = Math.min(Math.max(Number(url.searchParams.get('limit') || 50), 1), 200)
+  const offset = Math.max(Number(url.searchParams.get('offset') || 0), 0)
+  const type = url.searchParams.get('type') || 'all'
+  const conditionId = url.searchParams.get('conditionId')
+
+  const validTypes = ['all', 'buy', 'sell']
+  if (!validTypes.includes(type)) {
+    json(res, 400, { error: 'Invalid type. Use: all, buy, sell' })
+    return
+  }
+
+  const conditions: string[] = ['wallet = {wallet:String}']
+  const params: Record<string, unknown> = { wallet, limit, offset }
+
+  if (type === 'buy' || type === 'sell') {
+    conditions.push(`side = {side:String}`)
+    params.side = type
+  }
+
+  if (conditionId) {
+    const condTokenIds = await getTokenIdsForCondition(conditionId)
+    if (condTokenIds.length === 0) {
+      json(res, 200, [])
+      return
+    }
+    conditions.push(`token_id IN ({filterTokenIds:Array(String)})`)
+    params.filterTokenIds = condTokenIds
+  }
 
   const result = await client.query({
     query: `
       SELECT
         id,
-        block_timestamp,
+        toUnixTimestamp(block_timestamp) AS timestamp,
         side,
         token_id,
-        token_amount,
-        usdc_amount,
-        price_per_token
+        toFloat64(token_amount) / 1000000 AS amount,
+        toFloat64(usdc_amount) / 1000000 AS value,
+        price_per_token AS price
       FROM wallet_trades
-      WHERE wallet = {wallet:String}
+      WHERE ${conditions.join(' AND ')}
       ORDER BY block_timestamp DESC
       LIMIT {limit:UInt32}
+      OFFSET {offset:UInt32}
     `,
-    query_params: { wallet, limit },
+    query_params: params,
     format: 'JSONEachRow',
   })
 
   type TradeRow = {
     id: string
-    block_timestamp: string
+    timestamp: number
     side: string
     token_id: string
-    token_amount: string
-    usdc_amount: string
-    price_per_token: number
+    amount: number
+    value: number
+    price: number
   }
   const rows = await result.json() as TradeRow[]
 
-  // Enrich with market metadata
   const activityTokenIds = [...new Set(rows.map(r => r.token_id))]
-  const actMetaResult = await client.query({
-    query: `
-      SELECT condition_id, question, slug, outcomes, token_ids
-      FROM market_metadata FINAL
-      WHERE hasAny(token_ids, {tokenIds:Array(String)})
-    `,
-    query_params: { tokenIds: activityTokenIds },
-    format: 'JSONEachRow',
-  })
-  type ActMetaRow = { condition_id: string; question: string; slug: string; outcomes: string[]; token_ids: string[] }
-  const actMeta = await actMetaResult.json() as ActMetaRow[]
-  const actTokenMeta = new Map<string, { condition_id: string; question: string; outcome: string }>()
-  for (const m of actMeta) {
-    const tids = Array.isArray(m.token_ids) ? m.token_ids : []
-    const outs = Array.isArray(m.outcomes) ? m.outcomes : []
-    for (let i = 0; i < tids.length; i++) {
-      actTokenMeta.set(tids[i], { condition_id: m.condition_id, question: m.question, outcome: outs[i] ?? '' })
-    }
-  }
+  const metaMap = await getTokenMetaMap(activityTokenIds)
 
   const activity = rows.map(r => {
-    const meta = actTokenMeta.get(r.token_id)
+    const meta = metaMap.get(r.token_id)
     return {
-      type: 'trade' as const,
-      timestamp: r.block_timestamp,
-      condition_id: meta?.condition_id ?? '',
-      question: meta?.question ?? '',
-      outcome: meta?.outcome ?? '',
+      id: r.id,
+      type: r.side.toLowerCase(),
+      user: wallet,
+      conditionId: meta?.condition_id ?? '',
+      tokenId: r.token_id,
+      outcomeIndex: meta?.outcome_index ?? 0,
+      amount: r.amount,
+      price: r.price,
+      value: r.value,
       side: r.side.toUpperCase(),
-      price: r.price_per_token,
-      size: Number(r.token_amount) / 1e6,
-      value: Number(r.usdc_amount) / 1e6,
-      transaction_hash: r.id.split('-')[0] || '',
+      timestamp: r.timestamp,
+      txHash: r.id.split('-')[0] || '',
+      market: {
+        question: meta?.question ?? '',
+        slug: meta?.slug ?? '',
+      },
     }
   })
 
   json(res, 200, activity)
 }
 
+// ── NEW: Portfolio History ───────────────────────────────────────────
+
+async function handlePortfolioHistory(url: URL, res: ServerResponse) {
+  const user = url.searchParams.get('user')
+  if (!user || !isValidAddress(user)) {
+    json(res, 400, { error: 'Missing or invalid user address' })
+    return
+  }
+  const wallet = user.toLowerCase()
+
+  const validIntervals = ['1h', '6h', '1d', '1w']
+  const interval = url.searchParams.get('interval') || '1d'
+  if (!validIntervals.includes(interval)) {
+    json(res, 400, { error: 'Invalid interval. Use: 1h, 6h, 1d, 1w' })
+    return
+  }
+
+  const now = Math.floor(Date.now() / 1000)
+  const fromParam = url.searchParams.get('from')
+  const toParam = url.searchParams.get('to')
+  const fromTs = fromParam ? Math.floor(new Date(fromParam).getTime() / 1000) : now - 30 * 86400
+  const toTs = toParam ? Math.floor(new Date(toParam).getTime() / 1000) : now
+
+  const intervalSql: Record<string, string> = {
+    '1h': 'INTERVAL 1 HOUR',
+    '6h': 'INTERVAL 6 HOUR',
+    '1d': 'INTERVAL 1 DAY',
+    '1w': 'INTERVAL 1 WEEK',
+  }
+
+  const result = await client.query({
+    query: `
+      SELECT
+        toUnixTimestamp(toStartOfInterval(snapshot_time, ${intervalSql[interval]})) AS timestamp,
+        argMax(open_positions_value, snapshot_time) AS totalValue,
+        argMax(token_count, snapshot_time) AS positions,
+        argMax(realized_pnl + unrealized_pnl, snapshot_time) AS pnl
+      FROM wallet_pnl_snapshots FINAL
+      WHERE wallet = {wallet:String}
+        AND snapshot_time >= toDateTime64({fromTs:UInt64}, 3)
+        AND snapshot_time <= toDateTime64({toTs:UInt64}, 3)
+      GROUP BY timestamp
+      ORDER BY timestamp ASC
+    `,
+    query_params: { wallet, fromTs, toTs },
+    format: 'JSONEachRow',
+  })
+
+  const snapshots = await result.json() as Array<{
+    timestamp: number
+    totalValue: number
+    positions: number
+    pnl: number
+  }>
+
+  json(res, 200, { user: wallet, interval, snapshots })
+}
+
+// ── NEW: User Stats ─────────────────────────────────────────────────
+
+async function handleUserStats(url: URL, res: ServerResponse) {
+  const user = url.searchParams.get('user')
+  if (!user || !isValidAddress(user)) {
+    json(res, 400, { error: 'Missing or invalid user address' })
+    return
+  }
+  const wallet = user.toLowerCase()
+
+  // Basic trade stats from wallet_trades view
+  const statsResult = await client.query({
+    query: `
+      SELECT
+        count() AS totalTrades,
+        sum(toFloat64(usdc_amount)) / 1000000 AS totalVolume,
+        toUnixTimestamp(min(block_timestamp)) AS firstTradeAt,
+        toUnixTimestamp(max(block_timestamp)) AS lastTradeAt
+      FROM wallet_trades
+      WHERE wallet = {wallet:String}
+    `,
+    query_params: { wallet },
+    format: 'JSONEachRow',
+  })
+  const stats = (await statsResult.json() as any[])[0]
+
+  const totalTrades = Number(stats?.totalTrades ?? 0)
+  if (totalTrades === 0) {
+    json(res, 200, {
+      user: wallet, totalTrades: 0, totalVolume: 0, marketsTraded: 0,
+      winCount: null, lossCount: null, winRate: null, totalRealizedPnl: null,
+      bestTrade: null, worstTrade: null, firstTradeAt: null, lastTradeAt: null, avgTradeSize: 0,
+    })
+    return
+  }
+
+  const totalVolume = round2(Number(stats.totalVolume))
+
+  // Distinct token_ids → markets traded
+  const tokenResult = await client.query({
+    query: `SELECT DISTINCT token_id FROM wallet_trades WHERE wallet = {wallet:String}`,
+    query_params: { wallet },
+    format: 'JSONEachRow',
+  })
+  const tokenRows = await tokenResult.json() as Array<{ token_id: string }>
+  const tokenIds = tokenRows.map(r => r.token_id)
+  const metaMap = await getTokenMetaMap(tokenIds)
+  const conditionSet = new Set<string>()
+  for (const meta of metaMap.values()) conditionSet.add(meta.condition_id)
+
+  // Win/loss from wallet_ledger (populated per-wallet by build-ledger)
+  const ledgerResult = await client.query({
+    query: `
+      SELECT condition_id, sum(realized_pnl) AS total_pnl
+      FROM wallet_ledger FINAL
+      WHERE wallet = {wallet:String} AND realized_pnl != 0
+      GROUP BY condition_id
+    `,
+    query_params: { wallet },
+    format: 'JSONEachRow',
+  })
+  const ledgerRows = await ledgerResult.json() as Array<{ condition_id: string; total_pnl: number }>
+
+  let winCount: number | null = null
+  let lossCount: number | null = null
+  let winRate: number | null = null
+  let totalRealizedPnl: number | null = null
+  let bestTrade: { market: string; conditionId: string; pnl: number } | null = null
+  let worstTrade: { market: string; conditionId: string; pnl: number } | null = null
+
+  if (ledgerRows.length > 0) {
+    winCount = 0
+    lossCount = 0
+    totalRealizedPnl = 0
+    let bestPnl = -Infinity
+    let worstPnl = Infinity
+    let bestCid = ''
+    let worstCid = ''
+
+    for (const row of ledgerRows) {
+      totalRealizedPnl += row.total_pnl
+      if (row.total_pnl > 0) winCount++
+      else if (row.total_pnl < 0) lossCount++
+      if (row.total_pnl > bestPnl) { bestPnl = row.total_pnl; bestCid = row.condition_id }
+      if (row.total_pnl < worstPnl) { worstPnl = row.total_pnl; worstCid = row.condition_id }
+    }
+
+    winRate = (winCount + lossCount) > 0
+      ? Math.round((winCount / (winCount + lossCount)) * 1000) / 1000
+      : null
+    totalRealizedPnl = round2(totalRealizedPnl)
+
+    const findMeta = (cid: string) => [...metaMap.values()].find(m => m.condition_id === cid)
+    if (bestCid) bestTrade = { market: findMeta(bestCid)?.question ?? bestCid, conditionId: bestCid, pnl: round2(bestPnl) }
+    if (worstCid) worstTrade = { market: findMeta(worstCid)?.question ?? worstCid, conditionId: worstCid, pnl: round2(worstPnl) }
+  }
+
+  json(res, 200, {
+    user: wallet,
+    totalTrades,
+    totalVolume,
+    marketsTraded: conditionSet.size,
+    winCount,
+    lossCount,
+    winRate,
+    totalRealizedPnl,
+    bestTrade,
+    worstTrade,
+    firstTradeAt: Number(stats.firstTradeAt) || null,
+    lastTradeAt: Number(stats.lastTradeAt) || null,
+    avgTradeSize: totalTrades > 0 ? round2(totalVolume / totalTrades) : 0,
+  })
+}
+
+// ── NEW: Trades (per token on-chain history) ────────────────────────
+
+async function handleTrades(url: URL, res: ServerResponse) {
+  const tokenId = url.searchParams.get('tokenId')
+  if (!tokenId) {
+    json(res, 400, { error: 'Missing tokenId parameter' })
+    return
+  }
+  const limit = Math.min(Math.max(Number(url.searchParams.get('limit') || 50), 1), 200)
+  const offset = Math.max(Number(url.searchParams.get('offset') || 0), 0)
+
+  const result = await client.query({
+    query: `
+      SELECT
+        id,
+        price_per_token AS price,
+        toFloat64(token_amount) / 1000000 AS size,
+        if(is_taker_buy, 'BUY', 'SELL') AS side,
+        maker,
+        taker,
+        toUnixTimestamp(block_timestamp) AS timestamp,
+        tx_hash,
+        block_number
+      FROM trades
+      WHERE token_id = {tokenId:String}
+      ORDER BY block_timestamp DESC, log_index DESC
+      LIMIT 1 BY id
+      LIMIT {limit:UInt32}
+      OFFSET {offset:UInt32}
+    `,
+    query_params: { tokenId, limit, offset },
+    format: 'JSONEachRow',
+  })
+
+  const rows = await result.json() as Array<{
+    id: string; price: number; size: number; side: string
+    maker: string; taker: string; timestamp: number
+    tx_hash: string; block_number: number
+  }>
+
+  const trades = rows.map(r => ({
+    id: r.id,
+    price: r.price,
+    size: r.size,
+    side: r.side,
+    maker: r.maker,
+    taker: r.taker,
+    timestamp: r.timestamp,
+    txHash: r.tx_hash,
+    blockNumber: Number(r.block_number),
+  }))
+
+  json(res, 200, trades)
+}
+
+// ── NEW: Market Stats ───────────────────────────────────────────────
+
+async function handleMarketStats(url: URL, res: ServerResponse) {
+  const conditionId = url.searchParams.get('conditionId')
+  const tokenIdParam = url.searchParams.get('tokenId')
+
+  if (!conditionId && !tokenIdParam) {
+    json(res, 400, { error: 'Missing conditionId or tokenId parameter' })
+    return
+  }
+
+  let tokenIds: string[]
+  let resolvedConditionId = conditionId || ''
+
+  if (conditionId) {
+    tokenIds = await getTokenIdsForCondition(conditionId)
+    if (tokenIds.length === 0) {
+      json(res, 200, {})
+      return
+    }
+  } else {
+    tokenIds = [tokenIdParam!]
+    const metaMap = await getTokenMetaMap(tokenIds)
+    resolvedConditionId = metaMap.get(tokenIdParam!)?.condition_id ?? ''
+  }
+
+  // Trade stats
+  const tradeResult = await client.query({
+    query: `
+      SELECT
+        uniqExact(wallet) AS uniqueTraders,
+        count() AS totalTrades,
+        sum(toFloat64(usdc_amount)) / 1000000 AS onChainVolume,
+        avg(toFloat64(usdc_amount)) / 1000000 AS avgTradeSize,
+        max(toFloat64(usdc_amount)) / 1000000 AS largestTrade,
+        toUnixTimestamp(max(block_timestamp)) AS lastTradeAt,
+        sumIf(toFloat64(usdc_amount), block_timestamp >= now() - INTERVAL 24 HOUR) / 1000000 AS volume24h,
+        sumIf(toFloat64(usdc_amount), block_timestamp >= now() - INTERVAL 7 DAY) / 1000000 AS volume7d
+      FROM wallet_trades
+      WHERE token_id IN ({tokenIds:Array(String)})
+    `,
+    query_params: { tokenIds },
+    format: 'JSONEachRow',
+  })
+  const ts = (await tradeResult.json() as any[])[0] || {}
+
+  // Holder count
+  const holderResult = await client.query({
+    query: `
+      SELECT count() AS holderCount FROM (
+        SELECT wallet FROM user_balances
+        WHERE token_id IN ({tokenIds:Array(String)})
+        GROUP BY wallet HAVING sum(balance) > 0
+      )
+    `,
+    query_params: { tokenIds },
+    format: 'JSONEachRow',
+  })
+  const hc = (await holderResult.json() as any[])[0]?.holderCount ?? 0
+
+  // Top 5 holders + total supply for percentage
+  const topResult = await client.query({
+    query: `
+      SELECT wallet AS user, sum(toFloat64(balance)) / 1000000 AS balance
+      FROM user_balances
+      WHERE token_id IN ({tokenIds:Array(String)})
+        AND wallet != '0x0000000000000000000000000000000000000000'
+      GROUP BY wallet HAVING balance > 0
+      ORDER BY balance DESC
+      LIMIT 5
+    `,
+    query_params: { tokenIds },
+    format: 'JSONEachRow',
+  })
+  const topHolders = await topResult.json() as Array<{ user: string; balance: number }>
+
+  const supplyResult = await client.query({
+    query: `
+      SELECT sum(toFloat64(balance)) / 1000000 AS totalSupply
+      FROM user_balances
+      WHERE token_id IN ({tokenIds:Array(String)})
+        AND wallet != '0x0000000000000000000000000000000000000000'
+    `,
+    query_params: { tokenIds },
+    format: 'JSONEachRow',
+  })
+  const totalSupply = Number((await supplyResult.json() as any[])[0]?.totalSupply ?? 0)
+
+  json(res, 200, {
+    conditionId: resolvedConditionId,
+    uniqueTraders: Number(ts.uniqueTraders ?? 0),
+    totalTrades: Number(ts.totalTrades ?? 0),
+    onChainVolume: round2(Number(ts.onChainVolume ?? 0)),
+    volume24h: round2(Number(ts.volume24h ?? 0)),
+    volume7d: round2(Number(ts.volume7d ?? 0)),
+    avgTradeSize: round2(Number(ts.avgTradeSize ?? 0)),
+    largestTrade: round2(Number(ts.largestTrade ?? 0)),
+    lastTradeAt: Number(ts.lastTradeAt ?? 0),
+    holderCount: Number(hc),
+    topHolders: topHolders.map(h => ({
+      user: h.user,
+      balance: round2(h.balance),
+      percentage: totalSupply > 0 ? Math.round((h.balance / totalSupply) * 1000) / 10 : 0,
+    })),
+  })
+}
+
+// ── NEW: Leaderboard ────────────────────────────────────────────────
+
+async function handleLeaderboard(url: URL, res: ServerResponse) {
+  const sort = url.searchParams.get('sort') || 'pnl'
+  const limit = Math.min(Math.max(Number(url.searchParams.get('limit') || 20), 1), 100)
+  const period = url.searchParams.get('period') || 'all'
+
+  const validSorts = ['pnl', 'volume', 'trades']
+  if (!validSorts.includes(sort)) {
+    json(res, 400, { error: 'Invalid sort. Use: pnl, volume, trades' })
+    return
+  }
+  const validPeriods = ['24h', '7d', '30d', 'all']
+  if (!validPeriods.includes(period)) {
+    json(res, 400, { error: 'Invalid period. Use: 24h, 7d, 30d, all' })
+    return
+  }
+
+  const periodFilter: Record<string, string> = {
+    '24h': 'AND block_timestamp >= now() - INTERVAL 24 HOUR',
+    '7d': 'AND block_timestamp >= now() - INTERVAL 7 DAY',
+    '30d': 'AND block_timestamp >= now() - INTERVAL 30 DAY',
+    'all': '',
+  }
+
+  const sortCol: Record<string, string> = {
+    pnl: 'totalPnl',
+    volume: 'totalVolume',
+    trades: 'totalTrades',
+  }
+
+  const result = await client.query({
+    query: `
+      SELECT
+        wallet,
+        count() AS totalTrades,
+        sum(toFloat64(usdc_amount)) / 1000000 AS totalVolume,
+        sum(CASE WHEN side = 'sell' THEN toFloat64(usdc_amount) ELSE -toFloat64(usdc_amount) END) / 1000000 AS totalPnl,
+        uniqExact(token_id) AS marketsTraded
+      FROM wallet_trades
+      WHERE wallet != '0x0000000000000000000000000000000000000000'
+        ${periodFilter[period]}
+      GROUP BY wallet
+      HAVING totalTrades >= 5
+      ORDER BY ${sortCol[sort]} DESC
+      LIMIT {limit:UInt32}
+    `,
+    query_params: { limit },
+    format: 'JSONEachRow',
+  })
+
+  const rows = await result.json() as Array<{
+    wallet: string; totalTrades: number; totalVolume: number; totalPnl: number; marketsTraded: number
+  }>
+
+  json(res, 200, {
+    period,
+    sort,
+    updatedAt: Math.floor(Date.now() / 1000),
+    traders: rows.map((r, i) => ({
+      rank: i + 1,
+      user: r.wallet,
+      totalPnl: round2(Number(r.totalPnl)),
+      totalVolume: round2(Number(r.totalVolume)),
+      totalTrades: Number(r.totalTrades),
+      winRate: null,
+      marketsTraded: Number(r.marketsTraded),
+    })),
+  })
+}
+
+// ── Router ──────────────────────────────────────────────────────────
+
 const server = createServer(async (req, res) => {
-  // CORS preflight
   if (req.method === 'OPTIONS') {
     res.statusCode = 204
     res.setHeader('Access-Control-Allow-Origin', '*')
@@ -350,41 +798,23 @@ const server = createServer(async (req, res) => {
   const pathname = url.pathname
 
   try {
-    if (pathname === '/health') {
-      await handleHealth(req, res)
-      return
-    }
+    // Simple routes
+    if (pathname === '/health') { await handleHealth(req, res); return }
+    if (pathname === '/positions') { await handlePositions(url, res); return }
+    if (pathname === '/activity') { await handleActivity(url, res); return }
+    if (pathname === '/portfolio/history') { await handlePortfolioHistory(url, res); return }
+    if (pathname === '/user/stats') { await handleUserStats(url, res); return }
+    if (pathname === '/trades') { await handleTrades(url, res); return }
+    if (pathname === '/market/stats') { await handleMarketStats(url, res); return }
+    if (pathname === '/leaderboard') { await handleLeaderboard(url, res); return }
 
-    // Query-param based routes
-    if (pathname === '/positions') {
-      await handlePositions(url, res)
-      return
-    }
-    if (pathname === '/activity') {
-      await handleActivity(url, res)
-      return
-    }
-
-    // Path-param based routes: /:resource/:wallet
+    // Path-param routes: /:resource/:wallet
     const parts = pathname.split('/').filter(Boolean)
-    if (parts.length < 2) {
-      json(res, 404, { error: 'Not found' })
-      return
-    }
-
-    const [resource, wallet] = parts
-
-    if (resource === 'pnl') {
-      await handlePnl(wallet, url, res)
-      return
-    }
-    if (resource === 'snapshots') {
-      await handleSnapshots(wallet, url, res)
-      return
-    }
-    if (resource === 'ledger') {
-      await handleLedger(wallet, url, res)
-      return
+    if (parts.length >= 2) {
+      const [resource, wallet] = parts
+      if (resource === 'pnl') { await handlePnl(wallet, url, res); return }
+      if (resource === 'snapshots') { await handleSnapshots(wallet, url, res); return }
+      if (resource === 'ledger') { await handleLedger(wallet, url, res); return }
     }
 
     json(res, 404, { error: 'Not found' })
