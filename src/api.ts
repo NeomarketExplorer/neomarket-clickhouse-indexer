@@ -321,8 +321,7 @@ async function handleActivity(url: URL, res: ServerResponse) {
         side,
         token_id,
         toFloat64(token_amount) / 1000000 AS amount,
-        toFloat64(usdc_amount) / 1000000 AS value,
-        price_per_token AS price
+        toFloat64(usdc_amount) / 1000000 AS value
       FROM wallet_trades
       WHERE ${conditions.join(' AND ')}
       ORDER BY block_timestamp DESC
@@ -340,7 +339,6 @@ async function handleActivity(url: URL, res: ServerResponse) {
     token_id: string
     amount: number
     value: number
-    price: number
   }
   const rows = await result.json() as TradeRow[]
 
@@ -349,6 +347,7 @@ async function handleActivity(url: URL, res: ServerResponse) {
 
   const activity = rows.map(r => {
     const meta = metaMap.get(r.token_id)
+    const price = r.amount > 0 ? round2(r.value / r.amount) : 0
     return {
       id: r.id,
       type: r.side.toLowerCase(),
@@ -357,7 +356,7 @@ async function handleActivity(url: URL, res: ServerResponse) {
       tokenId: r.token_id,
       outcomeIndex: meta?.outcome_index ?? 0,
       amount: r.amount,
-      price: r.price,
+      price,
       value: r.value,
       side: r.side.toUpperCase(),
       timestamp: r.timestamp,
@@ -523,8 +522,8 @@ async function handleUserStats(url: URL, res: ServerResponse) {
     totalRealizedPnl = round2(totalRealizedPnl)
 
     const findMeta = (cid: string) => [...metaMap.values()].find(m => m.condition_id === cid)
-    if (bestCid) bestTrade = { market: findMeta(bestCid)?.question ?? bestCid, conditionId: bestCid, pnl: round2(bestPnl) }
-    if (worstCid) worstTrade = { market: findMeta(worstCid)?.question ?? worstCid, conditionId: worstCid, pnl: round2(worstPnl) }
+    if (bestPnl > -Infinity) bestTrade = { market: findMeta(bestCid)?.question ?? bestCid || 'Unknown', conditionId: bestCid, pnl: round2(bestPnl) }
+    if (worstPnl < Infinity) worstTrade = { market: findMeta(worstCid)?.question ?? worstCid || 'Unknown', conditionId: worstCid, pnl: round2(worstPnl) }
   }
 
   json(res, 200, {
@@ -559,7 +558,7 @@ async function handleTrades(url: URL, res: ServerResponse) {
     query: `
       SELECT
         id,
-        price_per_token AS price,
+        toFloat64(usdc_amount) / 1000000 AS value,
         toFloat64(token_amount) / 1000000 AS size,
         if(is_taker_buy, 'BUY', 'SELL') AS side,
         maker,
@@ -579,14 +578,14 @@ async function handleTrades(url: URL, res: ServerResponse) {
   })
 
   const rows = await result.json() as Array<{
-    id: string; price: number; size: number; side: string
+    id: string; value: number; size: number; side: string
     maker: string; taker: string; timestamp: number
     tx_hash: string; block_number: number
   }>
 
   const trades = rows.map(r => ({
     id: r.id,
-    price: r.price,
+    price: r.size > 0 ? round2(r.value / r.size) : 0,
     size: r.size,
     side: r.side,
     maker: r.maker,
@@ -746,7 +745,15 @@ async function handleLeaderboard(url: URL, res: ServerResponse) {
         sum(CASE WHEN side = 'sell' THEN toFloat64(usdc_amount) ELSE -toFloat64(usdc_amount) END) / 1000000 AS totalPnl,
         uniqExact(token_id) AS marketsTraded
       FROM wallet_trades
-      WHERE wallet != '0x0000000000000000000000000000000000000000'
+      WHERE wallet NOT IN (
+        '0x0000000000000000000000000000000000000000',
+        '0x4bfb41d5b3570defd03c39a9a4d8de6bd8b8982e',
+        '0xc5d563a36ae78145c45a50134d48a1215220f80a',
+        '0xd91e80cf2e7be2e162c6513ced06f1dd0da35296',
+        '0x3a3bd7bb9528e159577f7c2e685cc81a765002e2',
+        '0xe3f18acc55091e2c48d883fc8c8413319d4ab7b0',
+        '0xb768891e3130f6df18214ac804d4db76c2c37730'
+      )
         ${periodFilter[period]}
       GROUP BY wallet
       HAVING totalTrades >= 5
