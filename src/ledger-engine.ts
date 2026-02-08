@@ -2,20 +2,16 @@ import { createClient } from '@clickhouse/client'
 import 'dotenv/config'
 import { encodePacked, keccak256 } from 'viem'
 import {
-  USDC_SCALE,
-  TOKEN_SCALE,
   USDC_ADDRESS,
   NEGRISK_ADAPTER,
   NEGRISK_WRAPPED_COLLATERAL,
   CTF_EXCHANGE_BINARY,
   CTF_EXCHANGE_MULTI,
-  toTokenNumber,
   toUsdcNumber,
 } from './constants.js'
 
 const ZERO_ADDRESS = '0x0000000000000000000000000000000000000000'
 const ZERO_BYTES32 = '0x' + '0'.repeat(64)
-const TOKEN_PER_USDC = TOKEN_SCALE / USDC_SCALE
 
 export enum PnlMode {
   REALIZED_PERIOD_ONLY = 1,
@@ -385,6 +381,10 @@ const client = createClient({
   database: process.env.CLICKHOUSE_DATABASE || 'polymarket',
   username: process.env.CLICKHOUSE_USER || 'default',
   password: process.env.CLICKHOUSE_PASSWORD || '',
+  request_timeout: 300_000,
+  clickhouse_settings: {
+    max_execution_time: 300,
+  },
 })
 
 async function query<T>(sql: string): Promise<T[]> {
@@ -507,10 +507,11 @@ async function getTrades(wallet: string, endTs?: number): Promise<TradeRow[]> {
   const timeFilter = endTs ? `AND block_timestamp <= toDateTime64(${endTs}, 3)` : ''
   const sql = `
     SELECT *
-    FROM trades FINAL
+    FROM trades
     WHERE (maker = '${w}' OR taker = '${w}')
     ${timeFilter}
     ORDER BY block_timestamp ASC, log_index ASC
+    LIMIT 1 BY id
   `
   return query<TradeRow>(sql)
 }
@@ -520,10 +521,11 @@ async function getSplits(wallet: string, endTs?: number): Promise<SplitRow[]> {
   const timeFilter = endTs ? `AND block_timestamp <= toDateTime64(${endTs}, 3)` : ''
   const sql = `
     SELECT *
-    FROM splits FINAL
+    FROM splits
     WHERE stakeholder = '${w}'
     ${timeFilter}
     ORDER BY block_timestamp ASC, log_index ASC
+    LIMIT 1 BY id
   `
   return query<SplitRow>(sql)
 }
@@ -533,10 +535,11 @@ async function getMerges(wallet: string, endTs?: number): Promise<MergeRow[]> {
   const timeFilter = endTs ? `AND block_timestamp <= toDateTime64(${endTs}, 3)` : ''
   const sql = `
     SELECT *
-    FROM merges FINAL
+    FROM merges
     WHERE stakeholder = '${w}'
     ${timeFilter}
     ORDER BY block_timestamp ASC, log_index ASC
+    LIMIT 1 BY id
   `
   return query<MergeRow>(sql)
 }
@@ -546,10 +549,11 @@ async function getRedemptions(wallet: string, endTs?: number): Promise<Redemptio
   const timeFilter = endTs ? `AND block_timestamp <= toDateTime64(${endTs}, 3)` : ''
   const sql = `
     SELECT *
-    FROM redemptions FINAL
+    FROM redemptions
     WHERE redeemer = '${w}'
     ${timeFilter}
     ORDER BY block_timestamp ASC, log_index ASC
+    LIMIT 1 BY id
   `
   return query<RedemptionRow>(sql)
 }
@@ -559,10 +563,11 @@ async function getTransfers(wallet: string, endTs?: number): Promise<TransferRow
   const timeFilter = endTs ? `AND block_timestamp <= toDateTime64(${endTs}, 3)` : ''
   const sql = `
     SELECT *
-    FROM transfers FINAL
-    WHERE (from = '${w}' OR to = '${w}')
+    FROM transfers
+    WHERE (\`from\` = '${w}' OR \`to\` = '${w}')
     ${timeFilter}
     ORDER BY block_timestamp ASC, log_index ASC
+    LIMIT 1 BY id
   `
   return query<TransferRow>(sql)
 }
@@ -572,10 +577,11 @@ async function getAdapterSplits(wallet: string, endTs?: number): Promise<Adapter
   const timeFilter = endTs ? `AND block_timestamp <= toDateTime64(${endTs}, 3)` : ''
   const sql = `
     SELECT *
-    FROM adapter_splits FINAL
+    FROM adapter_splits
     WHERE stakeholder = '${w}'
     ${timeFilter}
     ORDER BY block_timestamp ASC, log_index ASC
+    LIMIT 1 BY id
   `
   return query<AdapterSplitRow>(sql)
 }
@@ -585,10 +591,11 @@ async function getAdapterMerges(wallet: string, endTs?: number): Promise<Adapter
   const timeFilter = endTs ? `AND block_timestamp <= toDateTime64(${endTs}, 3)` : ''
   const sql = `
     SELECT *
-    FROM adapter_merges FINAL
+    FROM adapter_merges
     WHERE stakeholder = '${w}'
     ${timeFilter}
     ORDER BY block_timestamp ASC, log_index ASC
+    LIMIT 1 BY id
   `
   return query<AdapterMergeRow>(sql)
 }
@@ -598,10 +605,11 @@ async function getAdapterRedemptions(wallet: string, endTs?: number): Promise<Ad
   const timeFilter = endTs ? `AND block_timestamp <= toDateTime64(${endTs}, 3)` : ''
   const sql = `
     SELECT *
-    FROM adapter_redemptions FINAL
+    FROM adapter_redemptions
     WHERE redeemer = '${w}'
     ${timeFilter}
     ORDER BY block_timestamp ASC, log_index ASC
+    LIMIT 1 BY id
   `
   return query<AdapterRedemptionRow>(sql)
 }
@@ -611,10 +619,11 @@ async function getAdapterConversions(wallet: string, endTs?: number): Promise<Ad
   const timeFilter = endTs ? `AND block_timestamp <= toDateTime64(${endTs}, 3)` : ''
   const sql = `
     SELECT *
-    FROM adapter_conversions FINAL
+    FROM adapter_conversions
     WHERE stakeholder = '${w}'
     ${timeFilter}
     ORDER BY block_timestamp ASC, log_index ASC
+    LIMIT 1 BY id
   `
   return query<AdapterConversionRow>(sql)
 }
@@ -624,10 +633,11 @@ async function getFeeRefunds(wallet: string, endTs?: number): Promise<FeeRefundR
   const timeFilter = endTs ? `AND block_timestamp <= toDateTime64(${endTs}, 3)` : ''
   const sql = `
     SELECT *
-    FROM fee_refunds FINAL
-    WHERE to = '${w}'
+    FROM fee_refunds
+    WHERE \`to\` = '${w}'
     ${timeFilter}
     ORDER BY block_timestamp ASC, log_index ASC
+    LIMIT 1 BY id
   `
   return query<FeeRefundRow>(sql)
 }
@@ -637,10 +647,11 @@ async function getFeeWithdrawals(wallet: string, endTs?: number): Promise<FeeWit
   const timeFilter = endTs ? `AND block_timestamp <= toDateTime64(${endTs}, 3)` : ''
   const sql = `
     SELECT *
-    FROM fee_withdrawals FINAL
-    WHERE to = '${w}'
+    FROM fee_withdrawals
+    WHERE \`to\` = '${w}'
     ${timeFilter}
     ORDER BY block_timestamp ASC, log_index ASC
+    LIMIT 1 BY id
   `
   return query<FeeWithdrawalRow>(sql)
 }
@@ -661,13 +672,13 @@ async function getConditionMeta(): Promise<ConditionMetaRow[]> {
       argMin(collateral_token, block_timestamp) as collateral_token
     FROM (
       SELECT condition_id, parent_collection_id, collateral_token, block_timestamp
-      FROM splits FINAL
+      FROM splits
       UNION ALL
       SELECT condition_id, parent_collection_id, collateral_token, block_timestamp
-      FROM merges FINAL
+      FROM merges
       UNION ALL
       SELECT condition_id, parent_collection_id, collateral_token, block_timestamp
-      FROM redemptions FINAL
+      FROM redemptions
     )
     GROUP BY condition_id
   `
@@ -704,7 +715,7 @@ function selectTransfers(
 function splitTokenAmountsFromTransfers(transfers: TransferRow[]): Map<string, number> {
   const map = new Map<string, number>()
   for (const t of transfers) {
-    const qty = toTokenNumber(BigInt(t.value))
+    const qty = toUsdcNumber(BigInt(t.value))
     const prev = map.get(t.token_id) || 0
     map.set(t.token_id, prev + qty)
   }
@@ -719,7 +730,7 @@ function computeFallbackTokenAmounts(
   const map = new Map<string, number>()
   if (!condition || condition.tokenIds.length === 0) return map
   const outcomeCount = condition.tokenIds.length
-  const amountTokens = toTokenNumber(usdcAmount * TOKEN_PER_USDC)
+  const amountTokens = toUsdcNumber(usdcAmount)
   const sets = indexSets && indexSets.length > 0
     ? indexSets
     : Array.from({ length: outcomeCount }, (_, i) => 1n << BigInt(i))
@@ -995,7 +1006,7 @@ async function buildLedger(
     if (transferSkipTxs.has(transfer.tx_hash)) continue
     if (
       tradeTxs.has(transfer.tx_hash) &&
-      [CTF_EXCHANGE_BINARY.toLowerCase(), CTF_EXCHANGE_MULTI.toLowerCase()].includes(
+      [CTF_EXCHANGE_BINARY.toLowerCase(), CTF_EXCHANGE_MULTI.toLowerCase(), NEGRISK_ADAPTER.toLowerCase()].includes(
         transfer.operator.toLowerCase()
       )
     ) {
@@ -1081,7 +1092,7 @@ async function buildLedger(
         const isMaker = trade.maker === w
         const isTaker = trade.taker === w
 
-        const qty = toTokenNumber(BigInt(trade.token_amount))
+        const qty = toUsdcNumber(BigInt(trade.token_amount))
         const usdc = toUsdcNumber(BigInt(trade.usdc_amount))
         const fee = toUsdcNumber(BigInt(trade.fee))
 
@@ -1497,7 +1508,7 @@ async function buildLedger(
         const amounts = parseArray(redemption.amounts)
         if (condition && amounts.length > 0) {
           for (let i = 0; i < Math.min(condition.tokenIds.length, amounts.length); i++) {
-            const qty = toTokenNumber(BigInt(amounts[i]))
+            const qty = toUsdcNumber(BigInt(amounts[i]))
             if (qty > 0) tokenAmounts.set(condition.tokenIds[i], qty)
           }
         }
@@ -1609,7 +1620,7 @@ async function buildLedger(
           const questionCount = negRiskMarketMap.get(conversion.market_id) || 0
           if (questionCount > 0) {
             const indexSet = BigInt(conversion.index_set)
-            const perQuestionQty = toTokenNumber(BigInt(conversion.amount))
+            const perQuestionQty = toUsdcNumber(BigInt(conversion.amount))
             const tokensByQuestion = computeNegRiskTokenIds(conversion.market_id, questionCount)
             for (let i = 0; i < questionCount; i++) {
               const tokenIds = tokensByQuestion[i]
@@ -1672,7 +1683,7 @@ async function buildLedger(
       case 'transfer': {
         const transfer = event.data as TransferRow
         const blockTimestamp = new Date(transfer.block_timestamp)
-        const qty = toTokenNumber(BigInt(transfer.value))
+        const qty = toUsdcNumber(BigInt(transfer.value))
         if (qty <= 0) break
 
         const from = transfer.from.toLowerCase()

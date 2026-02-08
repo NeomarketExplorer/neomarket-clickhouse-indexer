@@ -30,3 +30,7 @@ clickhouse_data/
 
 # Wallets file (contains addresses)
 wallets.txt
+
+# Local docs (not deployed)
+README.md
+CLICKHOUSE_INDEXER_PLAN.md
