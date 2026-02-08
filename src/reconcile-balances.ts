@@ -5,9 +5,23 @@
  *   tsx src/reconcile-balances.ts <wallet> [--rpc <url>] [--endTs <ts>] [--batch 100] [--tolerance 0.0001]
  */
 
-import { ethers } from 'ethers'
+import { createPublicClient, http, type Address } from 'viem'
+import { polygon } from 'viem/chains'
 import { CONDITIONAL_TOKENS, toTokenNumber } from './constants.js'
 import { getOpenPositionsForWallet, closeClient } from './ledger-engine.js'
+
+const balanceOfBatchAbi = [
+  {
+    name: 'balanceOfBatch',
+    type: 'function',
+    stateMutability: 'view',
+    inputs: [
+      { name: 'accounts', type: 'address[]' },
+      { name: 'ids', type: 'uint256[]' },
+    ],
+    outputs: [{ name: 'balances', type: 'uint256[]' }],
+  },
+] as const
 
 async function main() {
   const args = process.argv.slice(2)
@@ -16,7 +30,7 @@ async function main() {
     process.exit(1)
   }
 
-  const wallet = args[0]
+  const wallet = args[0] as Address
   const rpc = args.includes('--rpc') ? args[args.indexOf('--rpc') + 1] : (process.env.RPC_ENDPOINT || 'https://polygon-rpc.com')
   const endTs = args.includes('--endTs') ? Number(args[args.indexOf('--endTs') + 1]) : undefined
   const batchSize = args.includes('--batch') ? Number(args[args.indexOf('--batch') + 1]) : 100
@@ -30,20 +44,24 @@ async function main() {
     return
   }
 
-  const provider = new ethers.JsonRpcProvider(rpc)
-  const abi = [
-    'function balanceOfBatch(address[] accounts, uint256[] ids) view returns (uint256[] balances)',
-  ]
-  const contract = new ethers.Contract(CONDITIONAL_TOKENS, abi, provider)
+  const client = createPublicClient({
+    chain: polygon,
+    transport: http(rpc),
+  })
 
   let mismatches = 0
   for (let i = 0; i < tokenIds.length; i += batchSize) {
     const batch = tokenIds.slice(i, i + batchSize)
     const accounts = batch.map(() => wallet)
-    const balances: bigint[] = await contract.balanceOfBatch(accounts, batch)
+    const balances = await client.readContract({
+      address: CONDITIONAL_TOKENS as Address,
+      abi: balanceOfBatchAbi,
+      functionName: 'balanceOfBatch',
+      args: [accounts, batch.map(id => BigInt(id))],
+    })
     for (let j = 0; j < batch.length; j++) {
       const tokenId = batch[j]
-      const onChain = toTokenNumber(BigInt(balances[j]))
+      const onChain = toTokenNumber(balances[j])
       const ledger = positions.get(tokenId) || 0
       const diff = Math.abs(onChain - ledger)
       if (diff > tolerance) {

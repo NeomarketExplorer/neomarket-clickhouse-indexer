@@ -1,126 +1,129 @@
 /**
- * Sync market metadata from the neomarket-indexer PostgreSQL
- * into ClickHouse market_metadata table.
+ * Sync market metadata from Gamma API into ClickHouse market_metadata table.
+ * No cross-container dependencies — hits Gamma API directly.
  *
  * Usage:
  *   npm run sync:metadata           # one-shot sync
  *   npm run sync:metadata -- --loop # sync every 5 minutes
  */
 
-import { createClient as createClickHouseClient } from '@clickhouse/client'
+import { createClient } from '@clickhouse/client'
 import 'dotenv/config'
 
-const POSTGRES_CONTAINER = 'postgres-tswcc4sko4sg8s00sgs8gwos-093551802429'
-const PG_HOST = process.env.PG_HOST || POSTGRES_CONTAINER
-const PG_PORT = Number(process.env.PG_PORT || 5432)
-const PG_USER = process.env.PG_USER || 'postgres'
-const PG_PASSWORD = process.env.PG_PASSWORD || 'postgres'
-const PG_DATABASE = process.env.PG_DATABASE || 'polymarket'
-
-const BATCH_SIZE = 5000
+const GAMMA_API = process.env.GAMMA_API_URL || 'https://gamma-api.polymarket.com'
+const BATCH_SIZE = 100 // Gamma API max per request
 const SYNC_INTERVAL_MS = 5 * 60 * 1000 // 5 minutes
 
-const ch = createClickHouseClient({
+const ch = createClient({
   url: process.env.CLICKHOUSE_URL || 'http://localhost:8123',
   database: process.env.CLICKHOUSE_DATABASE || 'polymarket',
   username: process.env.CLICKHOUSE_USER || 'default',
   password: process.env.CLICKHOUSE_PASSWORD || '',
 })
 
-interface MarketRow {
-  condition_id: string
-  market_id: string
+interface GammaMarket {
+  id: string
+  conditionId: string
   question: string
-  slug: string
-  outcomes: string[]
-  token_ids: string[]
-  neg_risk: boolean
+  slug?: string
+  outcomes: string // JSON string like '["Yes","No"]'
+  clobTokenIds?: string // JSON string like '["123","456"]'
+  active?: boolean
+  closed?: boolean
 }
 
-/**
- * Query Postgres via its HTTP interface isn't available,
- * so we use a TCP connection with the built-in pg module-less approach.
- * We'll use fetch against a simple query endpoint, or if that's not available,
- * shell out to psql.
- *
- * Simplest reliable approach: use node's net module to speak the pg wire protocol...
- * Actually, let's just use the pg npm package. It's one dependency.
- */
-
-async function queryPostgres(query: string): Promise<any[]> {
-  // Dynamic import so this only loads when sync-metadata runs
-  const pg = await import('pg')
-  const client = new pg.default.Client({
-    host: PG_HOST,
-    port: PG_PORT,
-    user: PG_USER,
-    password: PG_PASSWORD,
-    database: PG_DATABASE,
-  })
-  await client.connect()
+function parseJsonArray(val: string | undefined | null): string[] {
+  if (!val) return []
   try {
-    const result = await client.query(query)
-    return result.rows
-  } finally {
-    await client.end()
+    const parsed = JSON.parse(val)
+    return Array.isArray(parsed) ? parsed : []
+  } catch {
+    return []
   }
 }
 
-async function syncMetadata(): Promise<number> {
-  console.log('🔄 Syncing market metadata from PostgreSQL → ClickHouse...')
-  const startTime = Date.now()
+async function fetchGammaMarkets(offset: number, closed: boolean): Promise<GammaMarket[]> {
+  const params = new URLSearchParams({
+    limit: String(BATCH_SIZE),
+    offset: String(offset),
+    closed: String(closed),
+  })
+  const url = `${GAMMA_API}/markets?${params}`
+  const res = await fetch(url)
+  if (!res.ok) {
+    throw new Error(`Gamma API error: ${res.status} ${res.statusText}`)
+  }
+  return res.json() as Promise<GammaMarket[]>
+}
 
+async function syncMarkets(closed: boolean): Promise<number> {
   let offset = 0
   let totalSynced = 0
 
   while (true) {
-    const rows: MarketRow[] = await queryPostgres(`
-      SELECT
-        condition_id,
-        id AS market_id,
-        question,
-        COALESCE(slug, '') AS slug,
-        outcomes,
-        outcome_token_ids AS token_ids,
-        false AS neg_risk
-      FROM markets
-      WHERE condition_id IS NOT NULL
-        AND condition_id != ''
-      ORDER BY id
-      LIMIT ${BATCH_SIZE} OFFSET ${offset}
-    `)
+    const markets = await fetchGammaMarkets(offset, closed)
+    if (markets.length === 0) break
 
-    if (rows.length === 0) break
+    const values = markets
+      .filter(m => m.conditionId)
+      .map(m => ({
+        condition_id: m.conditionId,
+        market_id: m.id,
+        question: m.question,
+        slug: m.slug ?? '',
+        outcomes: parseJsonArray(m.outcomes),
+        token_ids: parseJsonArray(m.clobTokenIds),
+        neg_risk: false,
+      }))
 
-    const values = rows.map(row => ({
-      condition_id: row.condition_id,
-      market_id: row.market_id,
-      question: row.question,
-      slug: row.slug,
-      outcomes: Array.isArray(row.outcomes) ? row.outcomes : [],
-      token_ids: Array.isArray(row.token_ids) ? row.token_ids : [],
-      neg_risk: row.neg_risk,
-    }))
-
-    await ch.insert({
-      table: 'market_metadata',
-      values,
-      format: 'JSONEachRow',
-    })
-
-    totalSynced += rows.length
-    offset += rows.length
-
-    if (totalSynced % 50000 === 0) {
-      console.log(`  ... synced ${totalSynced} markets`)
+    if (values.length > 0) {
+      await ch.insert({
+        table: 'market_metadata',
+        values,
+        format: 'JSONEachRow',
+      })
     }
 
-    if (rows.length < BATCH_SIZE) break
+    totalSynced += values.length
+    offset += markets.length
+
+    if (totalSynced % 5000 === 0 && totalSynced > 0) {
+      console.log(`  ... synced ${totalSynced} markets (closed=${closed})`)
+    }
+
+    if (markets.length < BATCH_SIZE) break
+
+    // Rate limit: 50ms between requests
+    await new Promise(r => setTimeout(r, 50))
   }
 
-  const durationSec = ((Date.now() - startTime) / 1000).toFixed(1)
-  console.log(`✅ Synced ${totalSynced} markets in ${durationSec}s`)
   return totalSynced
+}
+
+async function syncMetadata(): Promise<number> {
+  console.log('🔄 Syncing market metadata from Gamma API → ClickHouse...')
+  const startTime = Date.now()
+
+  // Sync open markets (changes frequently)
+  const openCount = await syncMarkets(false)
+
+  // Sync closed markets (only on first run or if very few in DB)
+  const countResult = await ch.query({
+    query: 'SELECT count() AS c FROM market_metadata',
+    format: 'JSONEachRow',
+  })
+  const [{ c }] = await countResult.json() as [{ c: string }]
+  let closedCount = 0
+  if (Number(c) < 10000) {
+    // First sync or very few markets — also sync closed ones
+    console.log('  ... also syncing closed markets (first run)')
+    closedCount = await syncMarkets(true)
+  }
+
+  const total = openCount + closedCount
+  const durationSec = ((Date.now() - startTime) / 1000).toFixed(1)
+  console.log(`✅ Synced ${total} markets (${openCount} open, ${closedCount} closed) in ${durationSec}s`)
+  return total
 }
 
 async function main() {

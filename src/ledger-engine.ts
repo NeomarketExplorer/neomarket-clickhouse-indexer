@@ -1,6 +1,6 @@
 import { createClient } from '@clickhouse/client'
 import 'dotenv/config'
-import { solidityPackedKeccak256 } from 'ethers'
+import { encodePacked, keccak256 } from 'viem'
 import {
   USDC_SCALE,
   TOKEN_SCALE,
@@ -436,14 +436,14 @@ function weightedEntryTimestamp(consumptions: LotConsumption[]): number | undefi
 }
 
 function computeCollectionId(parentCollectionId: string, conditionId: string, indexSet: bigint): string {
-  return solidityPackedKeccak256(
+  return keccak256(encodePacked(
     ['bytes32', 'bytes32', 'uint256'],
-    [parentCollectionId, conditionId, indexSet]
-  )
+    [parentCollectionId as `0x${string}`, conditionId as `0x${string}`, indexSet]
+  ))
 }
 
 function computePositionId(collateralToken: string, collectionId: string): string {
-  const hex = solidityPackedKeccak256(['address', 'bytes32'], [collateralToken, collectionId])
+  const hex = keccak256(encodePacked(['address', 'bytes32'], [collateralToken as `0x${string}`, collectionId as `0x${string}`]))
   return BigInt(hex).toString()
 }
 
@@ -470,10 +470,10 @@ function computeNegRiskQuestionId(marketId: string, questionIndex: number): stri
 }
 
 function computeConditionIdFromQuestion(oracle: string, questionId: string, outcomeSlotCount: number): string {
-  return solidityPackedKeccak256(
+  return keccak256(encodePacked(
     ['address', 'bytes32', 'uint256'],
-    [oracle, questionId, BigInt(outcomeSlotCount)]
-  )
+    [oracle as `0x${string}`, questionId as `0x${string}`, BigInt(outcomeSlotCount)]
+  ))
 }
 
 function computeNegRiskTokenIds(marketId: string, questionCount: number): Array<{ yes: string; no: string }> {
