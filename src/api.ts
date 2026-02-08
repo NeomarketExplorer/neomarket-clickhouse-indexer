@@ -522,8 +522,8 @@ async function handleUserStats(url: URL, res: ServerResponse) {
     totalRealizedPnl = round2(totalRealizedPnl)
 
     const findMeta = (cid: string) => [...metaMap.values()].find(m => m.condition_id === cid)
-    if (bestPnl > -Infinity) bestTrade = { market: findMeta(bestCid)?.question ?? bestCid || 'Unknown', conditionId: bestCid, pnl: round2(bestPnl) }
-    if (worstPnl < Infinity) worstTrade = { market: findMeta(worstCid)?.question ?? worstCid || 'Unknown', conditionId: worstCid, pnl: round2(worstPnl) }
+    if (bestPnl > -Infinity) bestTrade = { market: findMeta(bestCid)?.question ?? (bestCid || 'Unknown'), conditionId: bestCid, pnl: round2(bestPnl) }
+    if (worstPnl < Infinity) worstTrade = { market: findMeta(worstCid)?.question ?? (worstCid || 'Unknown'), conditionId: worstCid, pnl: round2(worstPnl) }
   }
 
   json(res, 200, {
