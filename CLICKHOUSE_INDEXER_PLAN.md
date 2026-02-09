@@ -4,7 +4,7 @@
 
 ## Current Status: ALL ENDPOINTS DEPLOYED
 
-Deployed on Coolify (Hetzner 138.201.57.139). Indexer synced, API live with 11 endpoints, metadata sync active.
+Deployed on Coolify (Hetzner 138.201.57.139). Indexer synced, API live with 12 endpoints, metadata sync active.
 
 ### Completed
 
@@ -35,6 +35,7 @@ Deployed on Coolify (Hetzner 138.201.57.139). Indexer synced, API live with 11 e
 | Fix price computation (value/amount instead of stored price_per_token) | Done |
 | Filter contract addresses from leaderboard | Done |
 | Return full structure for empty market/stats | Done |
+| `/market/candles` OHLCV endpoint for price charts | Done |
 
 ### Repo
 

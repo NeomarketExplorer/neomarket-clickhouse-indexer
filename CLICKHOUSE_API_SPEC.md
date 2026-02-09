@@ -354,9 +354,56 @@ For these endpoints to work, the indexer needs:
 
 ---
 
+## Endpoint 7: Market OHLCV Candles
+
+**Why:** The frontend needs reliable price history for market charts. Polymarket's CLOB `/prices-history` returns empty for many markets. This aggregates on-chain trades into OHLCV candles for [Lightweight Charts](https://tradingview.github.io/lightweight-charts/).
+
+```
+GET /market/candles?conditionId=<string>&tokenId=<string>&interval=<string>&from=<unix_seconds>&to=<unix_seconds>&limit=<number>
+```
+
+**Query params:**
+| Param | Required | Type | Default | Description |
+|-------|----------|------|---------|-------------|
+| `conditionId` | yes* | string | — | Market condition ID. Either this or `tokenId` required. |
+| `tokenId` | yes* | string | — | Outcome token ID. If only `conditionId`, uses first (YES) token. |
+| `interval` | no | enum | `1h` | `1m`, `5m`, `15m`, `1h`, `4h`, `1d`, `1w` |
+| `from` | no | unix seconds | auto | Start time. Default depends on interval (24h for 1m, 7d for 1h, 90d for 1d). |
+| `to` | no | unix seconds | now | End time. |
+| `limit` | no | int | 500 | Max 5000 |
+
+**Response:**
+```json
+{
+  "conditionId": "0x797d...",
+  "tokenId": "22252502...",
+  "interval": "1h",
+  "candles": [
+    {
+      "time": 1707300000,
+      "open": 0.55,
+      "high": 0.58,
+      "low": 0.53,
+      "close": 0.56,
+      "volume": 1250.50,
+      "trades": 47
+    }
+  ]
+}
+```
+
+**Field notes:**
+- **Prices are 0-1 scale** (not cents). Frontend multiplies by 100 for display.
+- **`time` is unix seconds**, aligned to interval boundary. Sorted ascending.
+- **`volume`** is USDC volume (sum of usdc_amount for all trades in interval).
+- **No gap filling** — intervals with no trades are skipped (Lightweight Charts handles gaps).
+- Maps directly to `CandlestickSeries` + `HistogramSeries` (volume bars) with no transformation.
+
+---
+
 ## Implementation Status (Feb 9, 2026)
 
-All 6 endpoints are **IMPLEMENTED AND DEPLOYED**.
+All 7 endpoints are **IMPLEMENTED AND DEPLOYED**.
 
 | Endpoint | Status | Notes |
 |----------|--------|-------|
@@ -366,6 +413,7 @@ All 6 endpoints are **IMPLEMENTED AND DEPLOYED**.
 | `GET /trades` | DONE | Full on-chain history with maker/taker |
 | `GET /market/stats` | DONE | Supports both `conditionId` and `tokenId` params |
 | `GET /leaderboard` | DONE | Contract addresses filtered out; winRate always null for now |
+| `GET /market/candles` | DONE | OHLCV from on-chain trades, supports 7 intervals, conditionId/tokenId resolution |
 
 ### Response Conventions
 

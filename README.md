@@ -8,7 +8,7 @@ Subsquid + ClickHouse pipeline for Polymarket PnL and position tracking.
 
 - **Deployed on Coolify** (Hetzner 138.201.57.139)
 - **Indexer synced** -- processing live blocks (~82.7M+)
-- **API live** on port 3002 -- 11 endpoints including 6 new frontend endpoints
+- **API live** on port 3002 -- 12 endpoints including 7 new frontend endpoints
 - **Metadata sync** running -- 27k+ markets from Gamma API
 - **Uses viem** (not ethers) for all on-chain utils
 
@@ -42,11 +42,12 @@ Subsquid + ClickHouse pipeline for Polymarket PnL and position tracking.
 | `GET /activity?user=&limit=&offset=&type=&conditionId=` | Activity feed with type filter, conditionId filter, pagination |
 | `GET /trades?tokenId=&limit=&offset=` | On-chain trade history per token |
 | `GET /market/stats?conditionId=` or `?tokenId=` | Market analytics: traders, volume, holders |
+| `GET /market/candles?conditionId=&tokenId=&interval=&from=&to=&limit=` | OHLCV candles for price charts |
 | `GET /leaderboard?sort=&limit=&period=` | Trader rankings by PnL, volume, or trades |
 
 ### Data Availability
 
-- **Always available**: `/activity`, `/user/stats` (basic fields), `/trades`, `/market/stats`, `/leaderboard`, `/positions`
+- **Always available**: `/activity`, `/user/stats` (basic fields), `/trades`, `/market/stats`, `/market/candles`, `/leaderboard`, `/positions`
 - **Requires build-ledger** (per-wallet batch): `/portfolio/history`, `/pnl`, `/snapshots`, `/ledger`, and nullable fields in `/user/stats`
 
 ### Response Conventions
