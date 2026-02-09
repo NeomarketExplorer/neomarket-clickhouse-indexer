@@ -12,6 +12,7 @@
  *   GET /user/stats?user=ADDRESS
  *   GET /trades?tokenId=ID&limit=50&offset=0
  *   GET /market/stats?conditionId=ID (or ?tokenId=ID)
+ *   GET /market/candles?conditionId=&tokenId=&interval=1h&from=&to=&limit=500
  *   GET /leaderboard?sort=pnl&limit=20&period=all
  */
 
@@ -788,6 +789,112 @@ async function handleLeaderboard(url: URL, res: ServerResponse) {
   })
 }
 
+// ── NEW: Market Candles (OHLCV) ─────────────────────────────────────
+
+async function handleMarketCandles(url: URL, res: ServerResponse) {
+  const conditionId = url.searchParams.get('conditionId')
+  const tokenIdParam = url.searchParams.get('tokenId')
+
+  if (!conditionId && !tokenIdParam) {
+    json(res, 400, { error: 'Missing conditionId or tokenId parameter' })
+    return
+  }
+
+  const validIntervals = ['1m', '5m', '15m', '1h', '4h', '1d', '1w']
+  const interval = url.searchParams.get('interval') || '1h'
+  if (!validIntervals.includes(interval)) {
+    json(res, 400, { error: 'Invalid interval. Use: 1m, 5m, 15m, 1h, 4h, 1d, 1w' })
+    return
+  }
+
+  const limit = Math.min(Math.max(Number(url.searchParams.get('limit') || 500), 1), 5000)
+
+  // Resolve tokenId
+  let tokenId = tokenIdParam || ''
+  let resolvedConditionId = conditionId || ''
+
+  if (!tokenId) {
+    const tokenIds = await getTokenIdsForCondition(conditionId!)
+    if (tokenIds.length === 0) {
+      json(res, 400, { error: 'No tokens found for this conditionId' })
+      return
+    }
+    tokenId = tokenIds[0] // first outcome (YES)
+  }
+
+  if (!resolvedConditionId && tokenId) {
+    const metaMap = await getTokenMetaMap([tokenId])
+    resolvedConditionId = metaMap.get(tokenId)?.condition_id ?? ''
+  }
+
+  // Default time ranges based on interval
+  const now = Math.floor(Date.now() / 1000)
+  const defaultFrom: Record<string, number> = {
+    '1m': now - 24 * 3600,
+    '5m': now - 48 * 3600,
+    '15m': now - 7 * 86400,
+    '1h': now - 7 * 86400,
+    '4h': now - 30 * 86400,
+    '1d': now - 90 * 86400,
+    '1w': now - 365 * 86400,
+  }
+
+  const fromTs = Number(url.searchParams.get('from') || defaultFrom[interval])
+  const toTs = Number(url.searchParams.get('to') || now)
+
+  const intervalSql: Record<string, string> = {
+    '1m': 'INTERVAL 1 MINUTE',
+    '5m': 'INTERVAL 5 MINUTE',
+    '15m': 'INTERVAL 15 MINUTE',
+    '1h': 'INTERVAL 1 HOUR',
+    '4h': 'INTERVAL 4 HOUR',
+    '1d': 'INTERVAL 1 DAY',
+    '1w': 'INTERVAL 1 WEEK',
+  }
+
+  const result = await client.query({
+    query: `
+      SELECT
+        toUnixTimestamp(toStartOfInterval(block_timestamp, ${intervalSql[interval]})) AS time,
+        argMin(toFloat64(usdc_amount) / toFloat64(token_amount), block_timestamp) AS open,
+        max(toFloat64(usdc_amount) / toFloat64(token_amount)) AS high,
+        min(toFloat64(usdc_amount) / toFloat64(token_amount)) AS low,
+        argMax(toFloat64(usdc_amount) / toFloat64(token_amount), block_timestamp) AS close,
+        sum(toFloat64(usdc_amount)) / 1000000 AS volume,
+        count() AS trades
+      FROM trades
+      WHERE token_id = {tokenId:String}
+        AND block_timestamp >= toDateTime64({fromTs:UInt64}, 3)
+        AND block_timestamp <= toDateTime64({toTs:UInt64}, 3)
+        AND token_amount > 0
+      GROUP BY time
+      ORDER BY time ASC
+      LIMIT {limit:UInt32}
+    `,
+    query_params: { tokenId, fromTs, toTs, limit },
+    format: 'JSONEachRow',
+  })
+
+  const candles = await result.json() as Array<{
+    time: number; open: number; high: number; low: number; close: number; volume: number; trades: number
+  }>
+
+  json(res, 200, {
+    conditionId: resolvedConditionId,
+    tokenId,
+    interval,
+    candles: candles.map(c => ({
+      time: c.time,
+      open: round2(c.open),
+      high: round2(c.high),
+      low: round2(c.low),
+      close: round2(c.close),
+      volume: round2(c.volume),
+      trades: Number(c.trades),
+    })),
+  })
+}
+
 // ── Router ──────────────────────────────────────────────────────────
 
 const server = createServer(async (req, res) => {
@@ -817,6 +924,7 @@ const server = createServer(async (req, res) => {
     if (pathname === '/user/stats') { await handleUserStats(url, res); return }
     if (pathname === '/trades') { await handleTrades(url, res); return }
     if (pathname === '/market/stats') { await handleMarketStats(url, res); return }
+    if (pathname === '/market/candles') { await handleMarketCandles(url, res); return }
     if (pathname === '/leaderboard') { await handleLeaderboard(url, res); return }
 
     // Path-param routes: /:resource/:wallet
