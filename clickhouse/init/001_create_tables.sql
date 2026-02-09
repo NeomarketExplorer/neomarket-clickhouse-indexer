@@ -395,6 +395,35 @@ FROM polymarket.transfers
 WHERE `from` != '0x0000000000000000000000000000000000000000';
 
 -- =====================================================
+-- CANDLES (pre-aggregated 1-minute OHLCV from trades)
+-- =====================================================
+CREATE TABLE IF NOT EXISTS polymarket.candles_1m (
+    token_id String,
+    time DateTime,
+    open AggregateFunction(argMin, Float64, DateTime64(3)),
+    high AggregateFunction(max, Float64),
+    low AggregateFunction(min, Float64),
+    close AggregateFunction(argMax, Float64, DateTime64(3)),
+    volume AggregateFunction(sum, Float64),
+    trades AggregateFunction(count)
+) ENGINE = AggregatingMergeTree()
+ORDER BY (token_id, time);
+
+CREATE MATERIALIZED VIEW IF NOT EXISTS polymarket.candles_1m_mv TO polymarket.candles_1m AS
+SELECT
+    token_id,
+    toStartOfMinute(block_timestamp) AS time,
+    argMinState(toFloat64(usdc_amount) / toFloat64(token_amount), block_timestamp) AS open,
+    maxState(toFloat64(usdc_amount) / toFloat64(token_amount)) AS high,
+    minState(toFloat64(usdc_amount) / toFloat64(token_amount)) AS low,
+    argMaxState(toFloat64(usdc_amount) / toFloat64(token_amount), block_timestamp) AS close,
+    sumState(toFloat64(usdc_amount) / 1000000) AS volume,
+    countState() AS trades
+FROM polymarket.trades
+WHERE token_amount > 0
+GROUP BY token_id, time;
+
+-- =====================================================
 -- MARKET METADATA (for Gamma API sync)
 -- =====================================================
 CREATE TABLE IF NOT EXISTS polymarket.market_metadata (

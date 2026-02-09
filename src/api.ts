@@ -842,35 +842,69 @@ async function handleMarketCandles(url: URL, res: ServerResponse) {
   const fromTs = Number(url.searchParams.get('from') || defaultFrom[interval])
   const toTs = Number(url.searchParams.get('to') || now)
 
-  const intervalSql: Record<string, string> = {
-    '1m': 'INTERVAL 1 MINUTE',
-    '5m': 'INTERVAL 5 MINUTE',
-    '15m': 'INTERVAL 15 MINUTE',
-    '1h': 'INTERVAL 1 HOUR',
-    '4h': 'INTERVAL 4 HOUR',
-    '1d': 'INTERVAL 1 DAY',
-    '1w': 'INTERVAL 1 WEEK',
-  }
-
-  const result = await client.query({
-    query: `
+  // Query pre-aggregated candles_1m table instead of raw trades
+  let query: string
+  if (interval === '1m') {
+    // Direct read from 1-minute candles
+    query = `
       SELECT
-        toUnixTimestamp(toStartOfInterval(block_timestamp, ${intervalSql[interval]})) AS time,
-        argMin(toFloat64(usdc_amount) / toFloat64(token_amount), block_timestamp) AS open,
-        max(toFloat64(usdc_amount) / toFloat64(token_amount)) AS high,
-        min(toFloat64(usdc_amount) / toFloat64(token_amount)) AS low,
-        argMax(toFloat64(usdc_amount) / toFloat64(token_amount), block_timestamp) AS close,
-        sum(toFloat64(usdc_amount)) / 1000000 AS volume,
-        count() AS trades
-      FROM trades
+        toUnixTimestamp(time) AS time,
+        argMinMerge(open) AS open,
+        maxMerge(high) AS high,
+        minMerge(low) AS low,
+        argMaxMerge(close) AS close,
+        sumMerge(volume) AS volume,
+        countMerge(trades) AS trades
+      FROM candles_1m
       WHERE token_id = {tokenId:String}
-        AND block_timestamp >= toDateTime64({fromTs:UInt64}, 3)
-        AND block_timestamp <= toDateTime64({toTs:UInt64}, 3)
-        AND token_amount > 0
+        AND time >= toDateTime({fromTs:UInt64})
+        AND time <= toDateTime({toTs:UInt64})
       GROUP BY time
       ORDER BY time ASC
       LIMIT {limit:UInt32}
-    `,
+    `
+  } else {
+    // Re-aggregate 1m candles into larger buckets
+    const intervalSql: Record<string, string> = {
+      '5m': 'INTERVAL 5 MINUTE',
+      '15m': 'INTERVAL 15 MINUTE',
+      '1h': 'INTERVAL 1 HOUR',
+      '4h': 'INTERVAL 4 HOUR',
+      '1d': 'INTERVAL 1 DAY',
+      '1w': 'INTERVAL 1 WEEK',
+    }
+    query = `
+      SELECT
+        toUnixTimestamp(toStartOfInterval(time, ${intervalSql[interval]})) AS time,
+        argMin(open_price, time) AS open,
+        max(high_price) AS high,
+        min(low_price) AS low,
+        argMax(close_price, time) AS close,
+        sum(vol) AS volume,
+        sum(trade_count) AS trades
+      FROM (
+        SELECT
+          time,
+          argMinMerge(open) AS open_price,
+          maxMerge(high) AS high_price,
+          minMerge(low) AS low_price,
+          argMaxMerge(close) AS close_price,
+          sumMerge(volume) AS vol,
+          countMerge(trades) AS trade_count
+        FROM candles_1m
+        WHERE token_id = {tokenId:String}
+          AND time >= toDateTime({fromTs:UInt64})
+          AND time <= toDateTime({toTs:UInt64})
+        GROUP BY time
+      )
+      GROUP BY time
+      ORDER BY time ASC
+      LIMIT {limit:UInt32}
+    `
+  }
+
+  const result = await client.query({
+    query,
     query_params: { tokenId, fromTs, toTs, limit },
     format: 'JSONEachRow',
   })
