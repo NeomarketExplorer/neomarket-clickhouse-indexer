@@ -615,7 +615,11 @@ async function handleMarketStats(url: URL, res: ServerResponse) {
   if (conditionId) {
     tokenIds = await getTokenIdsForCondition(conditionId)
     if (tokenIds.length === 0) {
-      json(res, 200, {})
+      json(res, 200, {
+        conditionId, uniqueTraders: 0, totalTrades: 0, onChainVolume: 0,
+        volume24h: 0, volume7d: 0, avgTradeSize: 0, largestTrade: 0,
+        lastTradeAt: 0, holderCount: 0, topHolders: [],
+      })
       return
     }
   } else {
