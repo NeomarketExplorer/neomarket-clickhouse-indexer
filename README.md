@@ -44,8 +44,8 @@ Subsquid + ClickHouse pipeline for Polymarket PnL and position tracking.
 | `GET /trades?tokenId=&limit=&offset=` | On-chain trade history per token |
 | `GET /market/stats?conditionId=` or `?tokenId=` | Market analytics: traders, volume, holders |
 | `GET /market/candles?conditionId=&tokenId=&interval=&from=&to=&limit=` | OHLCV candles for price charts |
-| `GET /leaderboard?sort=&limit=&period=` | Trader rankings by **net cashflow**, volume, or trades |
-| `GET /leaderboard/explain?user=&period=&limit=` | Transaction-level breakdown (with tx hashes) for leaderboard calculations |
+| `GET /leaderboard?sort=&limit=&period=` | Trader rankings by **net cashflow**, **realized PnL** (ledger-backed), volume, or trades |
+| `GET /leaderboard/explain?user=&period=&limit=&metric=` | Audit breakdown (with tx hashes) for `metric=netCashflow` or `metric=pnl` |
 
 ### Data Availability
 
@@ -58,8 +58,10 @@ Subsquid + ClickHouse pipeline for Polymarket PnL and position tracking.
 - Timestamps are **unix seconds** (numbers), not ISO strings
 - Empty results return full structure with zero values / empty arrays (not 404)
 - Nullable fields (`winRate`, `winCount`, `bestTrade`, etc.) return `null` when no ledger data
-- `/leaderboard` currently ranks by **net cashflow** (`sum(sell_usdc) - sum(buy_usdc)`), not realized PnL
-- Legacy leaderboard field `totalPnl` is retained for compatibility and currently equals `netCashflowUsd`
+- `/leaderboard?sort=netCashflow` ranks by net cashflow (`sum(sell_usdc) - sum(buy_usdc)`)
+- `/leaderboard?sort=pnl` ranks by realized PnL from `wallet_ledger` (coverage depends on ledger/snapshot jobs)
+- Leaderboard rows now include both `netCashflowUsd` and `realizedPnlUsd` (when available)
+- Legacy leaderboard field `totalPnl` is retained for compatibility and equals `netCashflowUsd`
 
 ## Environment Variables
 
