@@ -929,7 +929,7 @@ async function handleLeaderboardExplain(url: URL, res: ServerResponse) {
   const detailsResult = await client.query({
     query: `
       SELECT
-        tx_hash,
+        id,
         block_timestamp,
         token_id,
         side,
@@ -946,7 +946,7 @@ async function handleLeaderboardExplain(url: URL, res: ServerResponse) {
   })
 
   const rows = await detailsResult.json() as Array<{
-    tx_hash: string
+    id: string
     block_timestamp: string
     token_id: string
     side: 'buy' | 'sell'
@@ -957,8 +957,10 @@ async function handleLeaderboardExplain(url: URL, res: ServerResponse) {
   let runningNetCashflow = 0
   const events = rows.map((row) => {
     runningNetCashflow += Number(row.signed_usdc)
+    const txHash = row.id.split('-')[0]
     return {
-      txHash: row.tx_hash,
+      eventId: row.id,
+      txHash,
       blockTimestamp: row.block_timestamp,
       blockTimestampUnix: Math.floor(new Date(row.block_timestamp).getTime() / 1000),
       tokenId: row.token_id,
