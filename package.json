@@ -19,7 +19,8 @@
     "pnl:snapshots": "tsx src/pnl-from-snapshots.ts",
     "reconcile": "tsx src/reconcile-balances.ts",
     "api": "tsx src/api.ts",
-    "sync:metadata": "tsx src/sync-metadata.ts"
+    "sync:metadata": "tsx src/sync-metadata.ts",
+    "audit:leaderboard": "node --import tsx src/leaderboard-audit-agent.ts"
   },
   "dependencies": {
     "@clickhouse/client": "^1.14.0",

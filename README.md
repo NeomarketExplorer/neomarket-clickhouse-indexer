@@ -9,6 +9,7 @@ Subsquid + ClickHouse pipeline for Polymarket PnL and position tracking.
 - **Deployed on Coolify** (Hetzner 138.201.57.139)
 - **Indexer synced** -- processing live blocks (~82.7M+)
 - **API live** on port 3002 -- 12 endpoints including 7 new frontend endpoints
+- **Candles optimized** -- `candles_1m` AggregatingMergeTree + MV for <300ms OHLCV queries (was ~6s)
 - **Metadata sync** running -- 27k+ markets from Gamma API
 - **Uses viem** (not ethers) for all on-chain utils
 
@@ -67,12 +68,26 @@ CLICKHOUSE_DATABASE=polymarket
 CLICKHOUSE_USER=default
 CLICKHOUSE_PASSWORD=<coolify-generated>
 SQD_NETWORK_GATEWAY=https://v2.archive.subsquid.io/network/polygon-mainnet
-RPC_ENDPOINT=<your-polygon-rpc>
+RPC_ENDPOINT=<primary-polygon-rpc>
+RPC_ENDPOINTS=https://polygon-rpc.com,https://polygon.drpc.org,https://polygon-bor-rpc.publicnode.com
+RPC_HEALTHCHECK_TIMEOUT_MS=2500
+RPC_RATE_LIMIT=10
+RPC_CAPACITY=10
+RPC_REQUEST_TIMEOUT_MS=30000
+RPC_MAX_BATCH_CALL_SIZE=100
+FINALITY_CONFIRMATION=75
+HOT_BLOCKS_DEPTH=50
+RPC_HEAD_POLL_INTERVAL_MS=1000
+RPC_NEW_HEAD_TIMEOUT_MS=60000
 PROCESSOR_ID=polymarket-pnl
 START_BLOCK=4023686
 PORT=3002
 GAMMA_API_URL=https://gamma-api.polymarket.com
 ```
+
+- `RPC_ENDPOINTS` is a comma-separated fallback list. The indexer probes endpoints at startup and picks the first healthy one.
+- `run-with-restart.sh` rotates `RPC_ENDPOINT` across `RPC_ENDPOINTS` on each retry attempt.
+- For stricter accuracy over speed, raise `FINALITY_CONFIRMATION` and `HOT_BLOCKS_DEPTH` (for example `128`).
 
 ## Docker Networking
 
@@ -84,6 +99,7 @@ GAMMA_API_URL=https://gamma-api.polymarket.com
 | Script | Purpose |
 |--------|---------|
 | `npm run start` | Run indexer |
+| `./run-with-restart.sh` | Run indexer with auto-restart and RPC endpoint rotation |
 | `npm run api` | HTTP API on :3002 |
 | `npm run sync:metadata` | Sync market metadata from Gamma API |
 | `npm run sync:metadata -- --loop` | Continuous sync every 5 min |
@@ -91,6 +107,74 @@ GAMMA_API_URL=https://gamma-api.polymarket.com
 | `npm run backfill -- --wallets-file wallets.txt` | Batch ledger build |
 | `npm run snapshot:scheduler` | Periodic snapshot updates |
 | `npm run reconcile -- <wallet>` | Compare ledger vs on-chain balances |
+| `npm run audit:leaderboard -- --local-base http://localhost:3002 --strict` | Compare local leaderboard vs official Polymarket leaderboard |
+
+## Leaderboard Audit Agent
+
+Run a parity check against official Polymarket APIs:
+
+```bash
+npm run audit:leaderboard -- --local-base http://localhost:3002 --local-period all --local-sort pnl --pm-timeframe ALL --pm-sort PNL --limit 100 --compare-top 50 --min-overlap 0.20 --timeout-ms 30000 --strict
+```
+
+What it checks:
+- Upstream health: `data-api.polymarket.com`, `gamma-api.polymarket.com`, `clob.polymarket.com`
+- Wallet overlap/rank drift between local `/leaderboard` and Polymarket official leaderboard
+- JSON report output (use `--report-file /path/report.json`)
+- Request timeout control (use `--timeout-ms`)
+
+## Leaderboard MV Backfill (Existing Deployments)
+
+`/leaderboard` now uses pre-aggregated tables:
+- `wallet_leaderboard_stats_1h`
+- `wallet_leaderboard_stats_all`
+
+For an existing ClickHouse instance with historical data, run a one-time backfill:
+1. Temporarily stop the indexer container to avoid overlap while backfilling.
+2. Run the two `INSERT ... SELECT` statements below.
+3. Start the indexer again.
+
+```sql
+INSERT INTO polymarket.wallet_leaderboard_stats_1h
+SELECT
+  toStartOfHour(block_timestamp) AS bucket,
+  tupleElement(participant, 1) AS wallet,
+  countState() AS trades_state,
+  sumState(usdc_value) AS volume_state,
+  sumState(if(tupleElement(participant, 2) = 'sell', usdc_value, -usdc_value)) AS pnl_state,
+  uniqExactState(token_id) AS markets_state
+FROM (
+  SELECT
+    block_timestamp,
+    token_id,
+    toFloat64(usdc_amount) / 1000000 AS usdc_value,
+    arrayJoin([
+      tuple(maker, if(is_maker_buy, 'buy', 'sell')),
+      tuple(taker, if(is_taker_buy, 'buy', 'sell'))
+    ]) AS participant
+  FROM polymarket.trades
+)
+GROUP BY bucket, wallet;
+
+INSERT INTO polymarket.wallet_leaderboard_stats_all
+SELECT
+  tupleElement(participant, 1) AS wallet,
+  countState() AS trades_state,
+  sumState(usdc_value) AS volume_state,
+  sumState(if(tupleElement(participant, 2) = 'sell', usdc_value, -usdc_value)) AS pnl_state,
+  uniqExactState(token_id) AS markets_state
+FROM (
+  SELECT
+    token_id,
+    toFloat64(usdc_amount) / 1000000 AS usdc_value,
+    arrayJoin([
+      tuple(maker, if(is_maker_buy, 'buy', 'sell')),
+      tuple(taker, if(is_taker_buy, 'buy', 'sell'))
+    ]) AS participant
+  FROM polymarket.trades
+)
+GROUP BY wallet;
+```
 
 ## Architecture
 

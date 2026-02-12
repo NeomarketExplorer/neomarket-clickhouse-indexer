@@ -4,7 +4,7 @@
 services:
   indexer:
     build: .
-    command: ["bash", "-lc", "npm run start"]
+    command: ["bash", "-lc", "./run-with-restart.sh"]
     env_file: /opt/subsquid_poli/.env
     restart: unless-stopped
     deploy:

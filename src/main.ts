@@ -35,6 +35,97 @@ import type {
   FeeWithdrawal,
 } from './tables/index.js'
 
+function parsePositiveIntEnv(name: string, fallback: number): number {
+  const raw = process.env[name]
+  if (!raw) return fallback
+  const parsed = Number(raw)
+  return Number.isFinite(parsed) && parsed > 0 ? Math.trunc(parsed) : fallback
+}
+
+function parseOptionalPositiveIntEnv(name: string): number | undefined {
+  const raw = process.env[name]
+  if (!raw) return undefined
+  const parsed = Number(raw)
+  if (!Number.isFinite(parsed) || parsed <= 0) return undefined
+  return Math.trunc(parsed)
+}
+
+function parseRpcEndpoints(): string[] {
+  const preferred = process.env.RPC_ENDPOINT?.trim()
+  const fallbackList = (process.env.RPC_ENDPOINTS || '')
+    .split(',')
+    .map((value) => value.trim())
+    .filter((value) => value.length > 0)
+
+  const candidates = [
+    ...(preferred ? [preferred] : []),
+    ...fallbackList,
+  ]
+
+  if (candidates.length === 0) {
+    return [
+      'https://polygon-rpc.com',
+      'https://polygon.drpc.org',
+      'https://polygon-bor-rpc.publicnode.com',
+    ]
+  }
+
+  return Array.from(new Set(candidates))
+}
+
+async function isRpcEndpointHealthy(url: string, timeoutMs: number): Promise<boolean> {
+  const controller = new AbortController()
+  const timeout = setTimeout(() => controller.abort(), timeoutMs)
+
+  try {
+    const response = await fetch(url, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        jsonrpc: '2.0',
+        id: 1,
+        method: 'eth_blockNumber',
+        params: [],
+      }),
+      signal: controller.signal,
+    })
+
+    if (!response.ok) return false
+
+    const payload = await response.json() as { result?: string }
+    return typeof payload.result === 'string'
+  } catch {
+    return false
+  } finally {
+    clearTimeout(timeout)
+  }
+}
+
+async function selectRpcEndpoint(): Promise<string> {
+  const timeoutMs = parsePositiveIntEnv('RPC_HEALTHCHECK_TIMEOUT_MS', 2500)
+  const endpoints = parseRpcEndpoints()
+
+  for (const endpoint of endpoints) {
+    if (await isRpcEndpointHealthy(endpoint, timeoutMs)) {
+      return endpoint
+    }
+    console.warn(`[rpc] endpoint failed health check: ${endpoint}`)
+  }
+
+  console.warn('[rpc] no healthy endpoint found; using first configured endpoint')
+  return endpoints[0]
+}
+
+const HOT_BLOCKS_DEPTH = parsePositiveIntEnv('HOT_BLOCKS_DEPTH', 50)
+const FINALITY_CONFIRMATION = parsePositiveIntEnv('FINALITY_CONFIRMATION', 75)
+const RPC_RATE_LIMIT = parsePositiveIntEnv('RPC_RATE_LIMIT', 10)
+const RPC_CAPACITY = parsePositiveIntEnv('RPC_CAPACITY', 10)
+const RPC_REQUEST_TIMEOUT_MS = parsePositiveIntEnv('RPC_REQUEST_TIMEOUT_MS', 30_000)
+const RPC_MAX_BATCH_CALL_SIZE = parsePositiveIntEnv('RPC_MAX_BATCH_CALL_SIZE', 100)
+const RPC_HEAD_POLL_INTERVAL_MS = parseOptionalPositiveIntEnv('RPC_HEAD_POLL_INTERVAL_MS')
+const RPC_NEW_HEAD_TIMEOUT_MS = parseOptionalPositiveIntEnv('RPC_NEW_HEAD_TIMEOUT_MS')
+const SELECTED_RPC_ENDPOINT = await selectRpcEndpoint()
+
 // Initialize ClickHouse client
 const client = createClient({
   url: process.env.CLICKHOUSE_URL || 'http://localhost:8123',
@@ -49,7 +140,7 @@ const database = new ClickhouseDatabase({
   processorId: process.env.PROCESSOR_ID || 'polymarket-pnl',
   network: 'polygon',
   supportHotBlocks: true,
-  hotBlocksDepth: 50,
+  hotBlocksDepth: HOT_BLOCKS_DEPTH,
   autoMigrate: true,
   migrationInterval: 100,
 })
@@ -58,10 +149,13 @@ const database = new ClickhouseDatabase({
 const processor = new EvmBatchProcessor()
   .setGateway(process.env.SQD_NETWORK_GATEWAY || 'https://v2.archive.subsquid.io/network/polygon-mainnet')
   .setRpcEndpoint({
-    url: process.env.RPC_ENDPOINT || 'https://polygon-rpc.com',
-    rateLimit: 10,
+    url: SELECTED_RPC_ENDPOINT,
+    rateLimit: RPC_RATE_LIMIT,
+    capacity: RPC_CAPACITY,
+    requestTimeout: RPC_REQUEST_TIMEOUT_MS,
+    maxBatchCallSize: RPC_MAX_BATCH_CALL_SIZE,
   })
-  .setFinalityConfirmation(75) // Polygon finality
+  .setFinalityConfirmation(FINALITY_CONFIRMATION) // Polygon finality
   .setBlockRange({ from: Number(process.env.START_BLOCK) || START_BLOCK })
   .setFields({
     log: {
@@ -116,6 +210,18 @@ const processor = new EvmBatchProcessor()
       feeModule.events.FeeWithdrawn.topic,
     ],
   })
+
+if (RPC_HEAD_POLL_INTERVAL_MS || RPC_NEW_HEAD_TIMEOUT_MS) {
+  processor.setRpcDataIngestionSettings({
+    ...(RPC_HEAD_POLL_INTERVAL_MS ? { headPollInterval: RPC_HEAD_POLL_INTERVAL_MS } : {}),
+    ...(RPC_NEW_HEAD_TIMEOUT_MS ? { newHeadTimeout: RPC_NEW_HEAD_TIMEOUT_MS } : {}),
+  })
+}
+
+console.log(
+  `[rpc] using ${SELECTED_RPC_ENDPOINT} (rateLimit=${RPC_RATE_LIMIT}, capacity=${RPC_CAPACITY}, requestTimeoutMs=${RPC_REQUEST_TIMEOUT_MS})`
+)
+console.log(`[sync] finality=${FINALITY_CONFIRMATION}, hotBlocksDepth=${HOT_BLOCKS_DEPTH}`)
 
 // Process blocks
 processor.run(database, async (ctx) => {
@@ -529,29 +635,27 @@ processor.run(database, async (ctx) => {
   }
 
   if (resolvedConditionIds.size > 0) {
-    const ids = Array.from(resolvedConditionIds)
-    const idList = ids.map((id) => `'${id}'`).join(', ')
-    if (idList.length > 0) {
-      const result = await client.query({
-        query: `
-          SELECT
-            condition_id,
-            min(conditions.created_block) AS created_block,
-            argMin(conditions.created_at, conditions.created_block) AS created_at
-          FROM conditions FINAL
-          WHERE condition_id IN (${idList})
-          GROUP BY condition_id
-        `,
-        format: 'JSONEachRow',
-      })
-      const rows = await result.json() as { condition_id: string; created_block: string; created_at: string }[]
-      for (const row of rows) {
-        if (!createdConditionMap.has(row.condition_id)) {
-          createdConditionMap.set(row.condition_id, {
-            created_block: BigInt(row.created_block),
-            created_at: new Date(row.created_at),
-          })
-        }
+    const conditionIds = Array.from(resolvedConditionIds)
+    const result = await client.query({
+      query: `
+        SELECT
+          condition_id,
+          min(conditions.created_block) AS created_block,
+          argMin(conditions.created_at, conditions.created_block) AS created_at
+        FROM conditions FINAL
+        WHERE condition_id IN ({conditionIds:Array(String)})
+        GROUP BY condition_id
+      `,
+      query_params: { conditionIds },
+      format: 'JSONEachRow',
+    })
+    const rows = await result.json() as { condition_id: string; created_block: string; created_at: string }[]
+    for (const row of rows) {
+      if (!createdConditionMap.has(row.condition_id)) {
+        createdConditionMap.set(row.condition_id, {
+          created_block: BigInt(row.created_block),
+          created_at: new Date(row.created_at),
+        })
       }
     }
   }
@@ -672,111 +776,33 @@ processor.run(database, async (ctx) => {
     height: row.height.toString(),
   }))
 
-  // Insert all data into ClickHouse
-  if (tradesRows.length > 0) {
-    await client.insert({
-      table: 'trades',
-      values: tradesRows,
-      format: 'JSONEachRow',
-      clickhouse_settings: { date_time_input_format: 'best_effort' },
-    })
-  }
-  if (splitsRows.length > 0) {
-    await client.insert({
-      table: 'splits',
-      values: splitsRows,
-      format: 'JSONEachRow',
-      clickhouse_settings: { date_time_input_format: 'best_effort' },
-    })
-  }
-  if (mergesRows.length > 0) {
-    await client.insert({
-      table: 'merges',
-      values: mergesRows,
-      format: 'JSONEachRow',
-      clickhouse_settings: { date_time_input_format: 'best_effort' },
-    })
-  }
-  if (redemptionsRows.length > 0) {
-    await client.insert({
-      table: 'redemptions',
-      values: redemptionsRows,
-      format: 'JSONEachRow',
-      clickhouse_settings: { date_time_input_format: 'best_effort' },
-    })
-  }
-  if (conditionsRows.length > 0) {
-    await client.insert({
-      table: 'conditions',
-      values: conditionsRows,
-      format: 'JSONEachRow',
-      clickhouse_settings: { date_time_input_format: 'best_effort' },
-    })
-  }
-  if (negRiskMarketsRows.length > 0) {
-    await client.insert({
-      table: 'neg_risk_markets',
-      values: negRiskMarketsRows,
-      format: 'JSONEachRow',
-      clickhouse_settings: { date_time_input_format: 'best_effort' },
-    })
-  }
-  if (transfersRows.length > 0) {
-    await client.insert({
-      table: 'transfers',
-      values: transfersRows,
-      format: 'JSONEachRow',
-      clickhouse_settings: { date_time_input_format: 'best_effort' },
-    })
-  }
-  if (adapterSplitsRows.length > 0) {
-    await client.insert({
-      table: 'adapter_splits',
-      values: adapterSplitsRows,
-      format: 'JSONEachRow',
-      clickhouse_settings: { date_time_input_format: 'best_effort' },
-    })
-  }
-  if (adapterMergesRows.length > 0) {
-    await client.insert({
-      table: 'adapter_merges',
-      values: adapterMergesRows,
-      format: 'JSONEachRow',
-      clickhouse_settings: { date_time_input_format: 'best_effort' },
-    })
-  }
-  if (adapterRedemptionsRows.length > 0) {
-    await client.insert({
-      table: 'adapter_redemptions',
-      values: adapterRedemptionsRows,
-      format: 'JSONEachRow',
-      clickhouse_settings: { date_time_input_format: 'best_effort' },
-    })
-  }
-  if (adapterConversionsRows.length > 0) {
-    await client.insert({
-      table: 'adapter_conversions',
-      values: adapterConversionsRows,
-      format: 'JSONEachRow',
-      clickhouse_settings: { date_time_input_format: 'best_effort' },
-    })
-  }
-  if (feeRefundsRows.length > 0) {
-    await client.insert({
-      table: 'fee_refunds',
-      values: feeRefundsRows,
-      format: 'JSONEachRow',
-      clickhouse_settings: { date_time_input_format: 'best_effort' },
-    })
-  }
-  if (feeWithdrawalsRows.length > 0) {
-    await client.insert({
-      table: 'fee_withdrawals',
-      values: feeWithdrawalsRows,
-      format: 'JSONEachRow',
-      clickhouse_settings: { date_time_input_format: 'best_effort' },
-    })
-  }
+  // Insert all tables in parallel for better throughput.
+  const insertBatches: Array<{ table: string; values: Record<string, unknown>[] }> = [
+    { table: 'trades', values: tradesRows as Record<string, unknown>[] },
+    { table: 'splits', values: splitsRows as Record<string, unknown>[] },
+    { table: 'merges', values: mergesRows as Record<string, unknown>[] },
+    { table: 'redemptions', values: redemptionsRows as Record<string, unknown>[] },
+    { table: 'conditions', values: conditionsRows as Record<string, unknown>[] },
+    { table: 'neg_risk_markets', values: negRiskMarketsRows as Record<string, unknown>[] },
+    { table: 'transfers', values: transfersRows as Record<string, unknown>[] },
+    { table: 'adapter_splits', values: adapterSplitsRows as Record<string, unknown>[] },
+    { table: 'adapter_merges', values: adapterMergesRows as Record<string, unknown>[] },
+    { table: 'adapter_redemptions', values: adapterRedemptionsRows as Record<string, unknown>[] },
+    { table: 'adapter_conversions', values: adapterConversionsRows as Record<string, unknown>[] },
+    { table: 'fee_refunds', values: feeRefundsRows as Record<string, unknown>[] },
+    { table: 'fee_withdrawals', values: feeWithdrawalsRows as Record<string, unknown>[] },
+  ]
+
+  await Promise.all(
+    insertBatches
+      .filter((batch) => batch.values.length > 0)
+      .map((batch) => client.insert({
+        table: batch.table,
+        values: batch.values,
+        format: 'JSONEachRow',
+        clickhouse_settings: { date_time_input_format: 'best_effort' },
+      }))
+  )
 
   const totalEvents =
     trades.length +

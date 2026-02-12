@@ -97,6 +97,107 @@ function round2(n: number): number {
   return Math.round(n * 100) / 100
 }
 
+const LEADERBOARD_EXCLUDED_WALLETS = [
+  '0x0000000000000000000000000000000000000000',
+  '0x4bfb41d5b3570defd03c39a9a4d8de6bd8b8982e',
+  '0xc5d563a36ae78145c45a50134d48a1215220f80a',
+  '0xd91e80cf2e7be2e162c6513ced06f1dd0da35296',
+  '0x3a3bd7bb9528e159577f7c2e685cc81a765002e2',
+  '0xe3f18acc55091e2c48d883fc8c8413319d4ab7b0',
+  '0xb768891e3130f6df18214ac804d4db76c2c37730',
+] as const
+
+const LEADERBOARD_EXCLUDED_WALLETS_SQL = LEADERBOARD_EXCLUDED_WALLETS.map((wallet) => `'${wallet}'`).join(', ')
+
+type LeaderboardRow = {
+  wallet: string
+  totalTrades: number
+  totalVolume: number
+  totalPnl: number
+  marketsTraded: number
+}
+
+async function queryLeaderboardFromMaterialized(period: string, sort: string, limit: number): Promise<LeaderboardRow[]> {
+  const sortCol: Record<string, string> = {
+    pnl: 'totalPnl',
+    volume: 'totalVolume',
+    trades: 'totalTrades',
+  }
+
+  let table = 'wallet_leaderboard_stats_1h'
+  let timeFilter = ''
+
+  if (period === 'all') {
+    table = 'wallet_leaderboard_stats_all'
+  } else {
+    const periodHours: Record<string, number> = {
+      '24h': 24,
+      '7d': 24 * 7,
+      '30d': 24 * 30,
+    }
+    timeFilter = `AND bucket >= toStartOfHour(now() - toIntervalHour(${periodHours[period]}))`
+  }
+
+  const result = await client.query({
+    query: `
+    SELECT
+      wallet,
+      countMerge(trades_state) AS totalTrades,
+      sumMerge(volume_state) AS totalVolume,
+      sumMerge(pnl_state) AS totalPnl,
+      uniqExactMerge(markets_state) AS marketsTraded
+    FROM ${table}
+    WHERE wallet NOT IN (${LEADERBOARD_EXCLUDED_WALLETS_SQL})
+      ${timeFilter}
+    GROUP BY wallet
+    HAVING totalTrades >= 5
+    ORDER BY ${sortCol[sort]} DESC
+    LIMIT {limit:UInt32}
+    `,
+    query_params: { limit },
+    format: 'JSONEachRow',
+  })
+
+  return await result.json() as LeaderboardRow[]
+}
+
+async function queryLeaderboardFromRaw(period: string, sort: string, limit: number): Promise<LeaderboardRow[]> {
+  const periodFilter: Record<string, string> = {
+    '24h': 'AND block_timestamp >= now() - INTERVAL 24 HOUR',
+    '7d': 'AND block_timestamp >= now() - INTERVAL 7 DAY',
+    '30d': 'AND block_timestamp >= now() - INTERVAL 30 DAY',
+    'all': '',
+  }
+
+  const sortCol: Record<string, string> = {
+    pnl: 'totalPnl',
+    volume: 'totalVolume',
+    trades: 'totalTrades',
+  }
+
+  const result = await client.query({
+    query: `
+      SELECT
+        wallet,
+        count() AS totalTrades,
+        sum(toFloat64(usdc_amount)) / 1000000 AS totalVolume,
+        sum(CASE WHEN side = 'sell' THEN toFloat64(usdc_amount) ELSE -toFloat64(usdc_amount) END) / 1000000 AS totalPnl,
+        uniqExact(token_id) AS marketsTraded
+      FROM wallet_trades
+      WHERE wallet NOT IN (${LEADERBOARD_EXCLUDED_WALLETS_SQL})
+        ${periodFilter[period]}
+      GROUP BY wallet
+      HAVING totalTrades >= 5
+      ORDER BY ${sortCol[sort]} DESC
+      LIMIT {limit:UInt32}
+    `,
+    query_params: { limit },
+    format: 'JSONEachRow',
+  })
+
+  return await result.json() as LeaderboardRow[]
+}
+
 // ── Existing Handlers ───────────────────────────────────────────────
 
 async function querySnapshot(wallet: string, ts: number) {
@@ -728,50 +829,16 @@ async function handleLeaderboard(url: URL, res: ServerResponse) {
     return
   }
 
-  const periodFilter: Record<string, string> = {
-    '24h': 'AND block_timestamp >= now() - INTERVAL 24 HOUR',
-    '7d': 'AND block_timestamp >= now() - INTERVAL 7 DAY',
-    '30d': 'AND block_timestamp >= now() - INTERVAL 30 DAY',
-    'all': '',
+  let rows: LeaderboardRow[] = []
+  try {
+    rows = await queryLeaderboardFromMaterialized(period, sort, limit)
+    if (rows.length === 0) {
+      throw new Error('materialized leaderboard returned no rows')
+    }
+  } catch (error) {
+    console.warn('[leaderboard] materialized query failed; falling back to raw query', error)
+    rows = await queryLeaderboardFromRaw(period, sort, limit)
   }
-
-  const sortCol: Record<string, string> = {
-    pnl: 'totalPnl',
-    volume: 'totalVolume',
-    trades: 'totalTrades',
-  }
-
-  const result = await client.query({
-    query: `
-      SELECT
-        wallet,
-        count() AS totalTrades,
-        sum(toFloat64(usdc_amount)) / 1000000 AS totalVolume,
-        sum(CASE WHEN side = 'sell' THEN toFloat64(usdc_amount) ELSE -toFloat64(usdc_amount) END) / 1000000 AS totalPnl,
-        uniqExact(token_id) AS marketsTraded
-      FROM wallet_trades
-      WHERE wallet NOT IN (
-        '0x0000000000000000000000000000000000000000',
-        '0x4bfb41d5b3570defd03c39a9a4d8de6bd8b8982e',
-        '0xc5d563a36ae78145c45a50134d48a1215220f80a',
-        '0xd91e80cf2e7be2e162c6513ced06f1dd0da35296',
-        '0x3a3bd7bb9528e159577f7c2e685cc81a765002e2',
-        '0xe3f18acc55091e2c48d883fc8c8413319d4ab7b0',
-        '0xb768891e3130f6df18214ac804d4db76c2c37730'
-      )
-        ${periodFilter[period]}
-      GROUP BY wallet
-      HAVING totalTrades >= 5
-      ORDER BY ${sortCol[sort]} DESC
-      LIMIT {limit:UInt32}
-    `,
-    query_params: { limit },
-    format: 'JSONEachRow',
-  })
-
-  const rows = await result.json() as Array<{
-    wallet: string; totalTrades: number; totalVolume: number; totalPnl: number; marketsTraded: number
-  }>
 
   json(res, 200, {
     period,
