@@ -4,7 +4,7 @@ import { writeFileSync } from 'node:fs'
 type LocalLeaderboardRow = {
   rank: number
   user: string
-  totalPnl: number
+  netCashflowUsd: number
   totalVolume: number
   totalTrades: number
 }
@@ -166,6 +166,7 @@ async function fetchLocalLeaderboard(baseUrl: string, period: string, sort: stri
   const data = await response.json() as { traders?: Array<{
     rank: number
     user: string
+    netCashflowUsd?: number
     totalPnl: number
     totalVolume: number
     totalTrades: number
@@ -174,7 +175,7 @@ async function fetchLocalLeaderboard(baseUrl: string, period: string, sort: stri
   return (data.traders || []).map((row) => ({
     rank: Number(row.rank),
     user: String(row.user).toLowerCase(),
-    totalPnl: Number(row.totalPnl),
+    netCashflowUsd: Number(row.netCashflowUsd ?? row.totalPnl ?? 0),
     totalVolume: Number(row.totalVolume),
     totalTrades: Number(row.totalTrades),
   }))
@@ -257,9 +258,9 @@ function compareLeaderboards(localRows: LocalLeaderboardRow[], pmRows: Polymarke
       localRank: local.rank,
       polymarketRank: pm.rank,
       rankDelta,
-      localPnl: round(local.totalPnl, 2),
+      localPnl: round(local.netCashflowUsd, 2),
       polymarketPnl: round(pm.pnl, 2),
-      pnlDelta: round(local.totalPnl - pm.pnl, 2),
+      pnlDelta: round(local.netCashflowUsd - pm.pnl, 2),
       localVolume: round(local.totalVolume, 2),
       polymarketVolume: round(pm.volume, 2),
       volumeDelta: round(local.totalVolume - pm.volume, 2),
@@ -291,7 +292,7 @@ function compareLeaderboards(localRows: LocalLeaderboardRow[], pmRows: Polymarke
 async function main() {
   const localBase = getArg('local-base', process.env.LOCAL_LEADERBOARD_API || 'http://localhost:3002')
   const localPeriod = getArg('local-period', 'all')
-  const localSort = getArg('local-sort', 'pnl')
+  const localSort = getArg('local-sort', 'netCashflow')
   const pmTimeframe = getArg('pm-timeframe', 'ALL')
   const pmSortBy = getArg('pm-sort', 'PNL')
   const limit = Math.max(1, Math.min(getNumberArg('limit', 100), 500))

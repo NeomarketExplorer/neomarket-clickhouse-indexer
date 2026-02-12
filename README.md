@@ -44,7 +44,8 @@ Subsquid + ClickHouse pipeline for Polymarket PnL and position tracking.
 | `GET /trades?tokenId=&limit=&offset=` | On-chain trade history per token |
 | `GET /market/stats?conditionId=` or `?tokenId=` | Market analytics: traders, volume, holders |
 | `GET /market/candles?conditionId=&tokenId=&interval=&from=&to=&limit=` | OHLCV candles for price charts |
-| `GET /leaderboard?sort=&limit=&period=` | Trader rankings by PnL, volume, or trades |
+| `GET /leaderboard?sort=&limit=&period=` | Trader rankings by **net cashflow**, volume, or trades |
+| `GET /leaderboard/explain?user=&period=&limit=` | Transaction-level breakdown (with tx hashes) for leaderboard calculations |
 
 ### Data Availability
 
@@ -57,6 +58,8 @@ Subsquid + ClickHouse pipeline for Polymarket PnL and position tracking.
 - Timestamps are **unix seconds** (numbers), not ISO strings
 - Empty results return full structure with zero values / empty arrays (not 404)
 - Nullable fields (`winRate`, `winCount`, `bestTrade`, etc.) return `null` when no ledger data
+- `/leaderboard` currently ranks by **net cashflow** (`sum(sell_usdc) - sum(buy_usdc)`), not realized PnL
+- Legacy leaderboard field `totalPnl` is retained for compatibility and currently equals `netCashflowUsd`
 
 ## Environment Variables
 
@@ -114,7 +117,7 @@ GAMMA_API_URL=https://gamma-api.polymarket.com
 Run a parity check against official Polymarket APIs:
 
 ```bash
-npm run audit:leaderboard -- --local-base http://localhost:3002 --local-period all --local-sort pnl --pm-timeframe ALL --pm-sort PNL --limit 100 --compare-top 50 --min-overlap 0.20 --timeout-ms 30000 --strict
+npm run audit:leaderboard -- --local-base http://localhost:3002 --local-period all --local-sort netCashflow --pm-timeframe ALL --pm-sort PNL --limit 100 --compare-top 50 --min-overlap 0.20 --timeout-ms 30000 --strict
 ```
 
 What it checks:

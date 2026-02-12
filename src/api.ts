@@ -13,7 +13,8 @@
  *   GET /trades?tokenId=ID&limit=50&offset=0
  *   GET /market/stats?conditionId=ID (or ?tokenId=ID)
  *   GET /market/candles?conditionId=&tokenId=&interval=1h&from=&to=&limit=500
- *   GET /leaderboard?sort=pnl&limit=20&period=all
+ *   GET /leaderboard?sort=netCashflow&limit=20&period=all
+ *   GET /leaderboard/explain?user=ADDRESS&period=all&limit=1000
  */
 
 import { createServer, IncomingMessage, ServerResponse } from 'node:http'
@@ -108,18 +109,22 @@ const LEADERBOARD_EXCLUDED_WALLETS = [
 ] as const
 
 const LEADERBOARD_EXCLUDED_WALLETS_SQL = LEADERBOARD_EXCLUDED_WALLETS.map((wallet) => `'${wallet}'`).join(', ')
+const LEADERBOARD_METRIC_ID = 'net_cashflow_usd_v1'
+const LEADERBOARD_METRIC_DEFINITION = 'sum(sell_usdc) - sum(buy_usdc)'
 
 type LeaderboardRow = {
   wallet: string
   totalTrades: number
   totalVolume: number
-  totalPnl: number
+  netCashflow: number
   marketsTraded: number
 }
 
-async function queryLeaderboardFromMaterialized(period: string, sort: string, limit: number): Promise<LeaderboardRow[]> {
+type LeaderboardSort = 'netCashflow' | 'volume' | 'trades'
+
+async function queryLeaderboardFromMaterialized(period: string, sort: LeaderboardSort, limit: number): Promise<LeaderboardRow[]> {
   const sortCol: Record<string, string> = {
-    pnl: 'totalPnl',
+    netCashflow: 'netCashflow',
     volume: 'totalVolume',
     trades: 'totalTrades',
   }
@@ -144,7 +149,7 @@ async function queryLeaderboardFromMaterialized(period: string, sort: string, li
       wallet,
       countMerge(trades_state) AS totalTrades,
       sumMerge(volume_state) AS totalVolume,
-      sumMerge(pnl_state) AS totalPnl,
+      sumMerge(pnl_state) AS netCashflow,
       uniqExactMerge(markets_state) AS marketsTraded
     FROM ${table}
     WHERE wallet NOT IN (${LEADERBOARD_EXCLUDED_WALLETS_SQL})
@@ -161,7 +166,7 @@ async function queryLeaderboardFromMaterialized(period: string, sort: string, li
   return await result.json() as LeaderboardRow[]
 }
 
-async function queryLeaderboardFromRaw(period: string, sort: string, limit: number): Promise<LeaderboardRow[]> {
+async function queryLeaderboardFromRaw(period: string, sort: LeaderboardSort, limit: number): Promise<LeaderboardRow[]> {
   const periodFilter: Record<string, string> = {
     '24h': 'AND block_timestamp >= now() - INTERVAL 24 HOUR',
     '7d': 'AND block_timestamp >= now() - INTERVAL 7 DAY',
@@ -170,7 +175,7 @@ async function queryLeaderboardFromRaw(period: string, sort: string, limit: numb
   }
 
   const sortCol: Record<string, string> = {
-    pnl: 'totalPnl',
+    netCashflow: 'netCashflow',
     volume: 'totalVolume',
     trades: 'totalTrades',
   }
@@ -181,7 +186,7 @@ async function queryLeaderboardFromRaw(period: string, sort: string, limit: numb
         wallet,
         count() AS totalTrades,
         sum(toFloat64(usdc_amount)) / 1000000 AS totalVolume,
-        sum(CASE WHEN side = 'sell' THEN toFloat64(usdc_amount) ELSE -toFloat64(usdc_amount) END) / 1000000 AS totalPnl,
+        sum(CASE WHEN side = 'sell' THEN toFloat64(usdc_amount) ELSE -toFloat64(usdc_amount) END) / 1000000 AS netCashflow,
         uniqExact(token_id) AS marketsTraded
       FROM wallet_trades
       WHERE wallet NOT IN (${LEADERBOARD_EXCLUDED_WALLETS_SQL})
@@ -814,13 +819,13 @@ async function handleMarketStats(url: URL, res: ServerResponse) {
 // ── NEW: Leaderboard ────────────────────────────────────────────────
 
 async function handleLeaderboard(url: URL, res: ServerResponse) {
-  const sort = url.searchParams.get('sort') || 'pnl'
+  const sort = url.searchParams.get('sort') || 'netCashflow'
   const limit = Math.min(Math.max(Number(url.searchParams.get('limit') || 20), 1), 100)
   const period = url.searchParams.get('period') || 'all'
 
-  const validSorts = ['pnl', 'volume', 'trades']
+  const validSorts = ['netCashflow', 'pnl', 'volume', 'trades']
   if (!validSorts.includes(sort)) {
-    json(res, 400, { error: 'Invalid sort. Use: pnl, volume, trades' })
+    json(res, 400, { error: 'Invalid sort. Use: netCashflow, volume, trades' })
     return
   }
   const validPeriods = ['24h', '7d', '30d', 'all']
@@ -829,30 +834,163 @@ async function handleLeaderboard(url: URL, res: ServerResponse) {
     return
   }
 
+  const normalizedSort: LeaderboardSort =
+    sort === 'pnl'
+      ? 'netCashflow'
+      : sort as LeaderboardSort
+
   let rows: LeaderboardRow[] = []
   try {
-    rows = await queryLeaderboardFromMaterialized(period, sort, limit)
+    rows = await queryLeaderboardFromMaterialized(period, normalizedSort, limit)
     if (rows.length === 0) {
       throw new Error('materialized leaderboard returned no rows')
     }
   } catch (error) {
     console.warn('[leaderboard] materialized query failed; falling back to raw query', error)
-    rows = await queryLeaderboardFromRaw(period, sort, limit)
+    rows = await queryLeaderboardFromRaw(period, normalizedSort, limit)
   }
 
   json(res, 200, {
     period,
     sort,
+    sortNormalized: normalizedSort,
     updatedAt: Math.floor(Date.now() / 1000),
+    metric: {
+      id: LEADERBOARD_METRIC_ID,
+      label: 'Net Cashflow (USD)',
+      isPnl: false,
+      formula: LEADERBOARD_METRIC_DEFINITION,
+      valueField: 'netCashflowUsd',
+      canonicalPnlMetricPlanned: 'realized_pnl_usd_v1',
+      notes: [
+        'This leaderboard currently ranks by net cashflow, not realized PnL.',
+        'Legacy field totalPnl is retained for compatibility and equals netCashflowUsd.',
+      ],
+    },
     traders: rows.map((r, i) => ({
       rank: i + 1,
       user: r.wallet,
-      totalPnl: round2(Number(r.totalPnl)),
+      netCashflowUsd: round2(Number(r.netCashflow)),
+      totalPnl: round2(Number(r.netCashflow)),
       totalVolume: round2(Number(r.totalVolume)),
       totalTrades: Number(r.totalTrades),
       winRate: null,
       marketsTraded: Number(r.marketsTraded),
     })),
+  })
+}
+
+async function handleLeaderboardExplain(url: URL, res: ServerResponse) {
+  const user = url.searchParams.get('user')
+  if (!user || !isValidAddress(user)) {
+    json(res, 400, { error: 'Missing or invalid user address' })
+    return
+  }
+
+  const wallet = user.toLowerCase()
+  const period = url.searchParams.get('period') || 'all'
+  const validPeriods = ['24h', '7d', '30d', 'all']
+  if (!validPeriods.includes(period)) {
+    json(res, 400, { error: 'Invalid period. Use: 24h, 7d, 30d, all' })
+    return
+  }
+
+  const limit = Math.min(Math.max(Number(url.searchParams.get('limit') || 1000), 1), 10000)
+
+  const periodFilter: Record<string, string> = {
+    '24h': 'AND block_timestamp >= now() - INTERVAL 24 HOUR',
+    '7d': 'AND block_timestamp >= now() - INTERVAL 7 DAY',
+    '30d': 'AND block_timestamp >= now() - INTERVAL 30 DAY',
+    'all': '',
+  }
+
+  const summaryResult = await client.query({
+    query: `
+      SELECT
+        count() AS totalTrades,
+        sum(toFloat64(usdc_amount)) / 1000000 AS totalVolume,
+        sum(if(side = 'sell', toFloat64(usdc_amount), -toFloat64(usdc_amount))) / 1000000 AS netCashflow,
+        uniqExact(token_id) AS marketsTraded
+      FROM wallet_trades
+      WHERE wallet = {wallet:String}
+        ${periodFilter[period]}
+    `,
+    query_params: { wallet },
+    format: 'JSONEachRow',
+  })
+
+  const summaryRow = (await summaryResult.json() as Array<{
+    totalTrades: number
+    totalVolume: number
+    netCashflow: number
+    marketsTraded: number
+  }>)[0]
+
+  const detailsResult = await client.query({
+    query: `
+      SELECT
+        tx_hash,
+        block_timestamp,
+        token_id,
+        side,
+        toFloat64(usdc_amount) / 1000000 AS usdc_amount,
+        if(side = 'sell', toFloat64(usdc_amount), -toFloat64(usdc_amount)) / 1000000 AS signed_usdc
+      FROM wallet_trades
+      WHERE wallet = {wallet:String}
+        ${periodFilter[period]}
+      ORDER BY block_timestamp ASC, tx_hash ASC
+      LIMIT {limit:UInt32}
+    `,
+    query_params: { wallet, limit },
+    format: 'JSONEachRow',
+  })
+
+  const rows = await detailsResult.json() as Array<{
+    tx_hash: string
+    block_timestamp: string
+    token_id: string
+    side: 'buy' | 'sell'
+    usdc_amount: number
+    signed_usdc: number
+  }>
+
+  let runningNetCashflow = 0
+  const events = rows.map((row) => {
+    runningNetCashflow += Number(row.signed_usdc)
+    return {
+      txHash: row.tx_hash,
+      blockTimestamp: row.block_timestamp,
+      blockTimestampUnix: Math.floor(new Date(row.block_timestamp).getTime() / 1000),
+      tokenId: row.token_id,
+      side: row.side,
+      usdcAmount: round2(Number(row.usdc_amount)),
+      signedCashflowUsd: round2(Number(row.signed_usdc)),
+      runningNetCashflowUsd: round2(runningNetCashflow),
+    }
+  })
+
+  json(res, 200, {
+    user: wallet,
+    period,
+    metric: {
+      id: LEADERBOARD_METRIC_ID,
+      label: 'Net Cashflow (USD)',
+      isPnl: false,
+      formula: LEADERBOARD_METRIC_DEFINITION,
+      notes: [
+        'Positive signed cashflow is sell-side USDC inflow.',
+        'Negative signed cashflow is buy-side USDC outflow.',
+      ],
+    },
+    summary: {
+      totalTrades: Number(summaryRow?.totalTrades ?? 0),
+      totalVolumeUsd: round2(Number(summaryRow?.totalVolume ?? 0)),
+      netCashflowUsd: round2(Number(summaryRow?.netCashflow ?? 0)),
+      marketsTraded: Number(summaryRow?.marketsTraded ?? 0),
+      eventCountReturned: events.length,
+      eventLimit: limit,
+    },
+    events,
   })
 }
 
@@ -1026,6 +1164,7 @@ const server = createServer(async (req, res) => {
     if (pathname === '/trades') { await handleTrades(url, res); return }
     if (pathname === '/market/stats') { await handleMarketStats(url, res); return }
     if (pathname === '/market/candles') { await handleMarketCandles(url, res); return }
+    if (pathname === '/leaderboard/explain') { await handleLeaderboardExplain(url, res); return }
     if (pathname === '/leaderboard') { await handleLeaderboard(url, res); return }
 
     // Path-param routes: /:resource/:wallet
