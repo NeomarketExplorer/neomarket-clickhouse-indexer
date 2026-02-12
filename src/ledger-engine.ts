@@ -384,6 +384,9 @@ const client = createClient({
   request_timeout: 300_000,
   clickhouse_settings: {
     max_execution_time: 300,
+    // Allow large wallet scans to spill sorting/grouping to disk instead of OOM.
+    max_bytes_before_external_sort: String(256 * 1024 * 1024),
+    max_bytes_before_external_group_by: String(256 * 1024 * 1024),
   },
 })
 
@@ -502,6 +505,17 @@ function normalizeAddress(value: string | null | undefined): string {
   return ZERO_ADDRESS
 }
 
+function dedupeById<T extends { id: string }>(rows: T[]): T[] {
+  const seen = new Set<string>()
+  const out: T[] = []
+  for (const row of rows) {
+    if (seen.has(row.id)) continue
+    seen.add(row.id)
+    out.push(row)
+  }
+  return out
+}
+
 async function getTrades(wallet: string, endTs?: number): Promise<TradeRow[]> {
   const w = wallet.toLowerCase()
   const timeFilter = endTs ? `AND block_timestamp <= toDateTime64(${endTs}, 3)` : ''
@@ -511,9 +525,8 @@ async function getTrades(wallet: string, endTs?: number): Promise<TradeRow[]> {
     WHERE (maker = '${w}' OR taker = '${w}')
     ${timeFilter}
     ORDER BY block_timestamp ASC, log_index ASC
-    LIMIT 1 BY id
   `
-  return query<TradeRow>(sql)
+  return dedupeById(await query<TradeRow>(sql))
 }
 
 async function getSplits(wallet: string, endTs?: number): Promise<SplitRow[]> {
@@ -525,9 +538,8 @@ async function getSplits(wallet: string, endTs?: number): Promise<SplitRow[]> {
     WHERE stakeholder = '${w}'
     ${timeFilter}
     ORDER BY block_timestamp ASC, log_index ASC
-    LIMIT 1 BY id
   `
-  return query<SplitRow>(sql)
+  return dedupeById(await query<SplitRow>(sql))
 }
 
 async function getMerges(wallet: string, endTs?: number): Promise<MergeRow[]> {
@@ -539,9 +551,8 @@ async function getMerges(wallet: string, endTs?: number): Promise<MergeRow[]> {
     WHERE stakeholder = '${w}'
     ${timeFilter}
     ORDER BY block_timestamp ASC, log_index ASC
-    LIMIT 1 BY id
   `
-  return query<MergeRow>(sql)
+  return dedupeById(await query<MergeRow>(sql))
 }
 
 async function getRedemptions(wallet: string, endTs?: number): Promise<RedemptionRow[]> {
@@ -553,9 +564,8 @@ async function getRedemptions(wallet: string, endTs?: number): Promise<Redemptio
     WHERE redeemer = '${w}'
     ${timeFilter}
     ORDER BY block_timestamp ASC, log_index ASC
-    LIMIT 1 BY id
   `
-  return query<RedemptionRow>(sql)
+  return dedupeById(await query<RedemptionRow>(sql))
 }
 
 async function getTransfers(wallet: string, endTs?: number): Promise<TransferRow[]> {
@@ -567,9 +577,8 @@ async function getTransfers(wallet: string, endTs?: number): Promise<TransferRow
     WHERE (\`from\` = '${w}' OR \`to\` = '${w}')
     ${timeFilter}
     ORDER BY block_timestamp ASC, log_index ASC
-    LIMIT 1 BY id
   `
-  return query<TransferRow>(sql)
+  return dedupeById(await query<TransferRow>(sql))
 }
 
 async function getAdapterSplits(wallet: string, endTs?: number): Promise<AdapterSplitRow[]> {
@@ -581,9 +590,8 @@ async function getAdapterSplits(wallet: string, endTs?: number): Promise<Adapter
     WHERE stakeholder = '${w}'
     ${timeFilter}
     ORDER BY block_timestamp ASC, log_index ASC
-    LIMIT 1 BY id
   `
-  return query<AdapterSplitRow>(sql)
+  return dedupeById(await query<AdapterSplitRow>(sql))
 }
 
 async function getAdapterMerges(wallet: string, endTs?: number): Promise<AdapterMergeRow[]> {
@@ -595,9 +603,8 @@ async function getAdapterMerges(wallet: string, endTs?: number): Promise<Adapter
     WHERE stakeholder = '${w}'
     ${timeFilter}
     ORDER BY block_timestamp ASC, log_index ASC
-    LIMIT 1 BY id
   `
-  return query<AdapterMergeRow>(sql)
+  return dedupeById(await query<AdapterMergeRow>(sql))
 }
 
 async function getAdapterRedemptions(wallet: string, endTs?: number): Promise<AdapterRedemptionRow[]> {
@@ -609,9 +616,8 @@ async function getAdapterRedemptions(wallet: string, endTs?: number): Promise<Ad
     WHERE redeemer = '${w}'
     ${timeFilter}
     ORDER BY block_timestamp ASC, log_index ASC
-    LIMIT 1 BY id
   `
-  return query<AdapterRedemptionRow>(sql)
+  return dedupeById(await query<AdapterRedemptionRow>(sql))
 }
 
 async function getAdapterConversions(wallet: string, endTs?: number): Promise<AdapterConversionRow[]> {
@@ -623,9 +629,8 @@ async function getAdapterConversions(wallet: string, endTs?: number): Promise<Ad
     WHERE stakeholder = '${w}'
     ${timeFilter}
     ORDER BY block_timestamp ASC, log_index ASC
-    LIMIT 1 BY id
   `
-  return query<AdapterConversionRow>(sql)
+  return dedupeById(await query<AdapterConversionRow>(sql))
 }
 
 async function getFeeRefunds(wallet: string, endTs?: number): Promise<FeeRefundRow[]> {
@@ -637,9 +642,8 @@ async function getFeeRefunds(wallet: string, endTs?: number): Promise<FeeRefundR
     WHERE \`to\` = '${w}'
     ${timeFilter}
     ORDER BY block_timestamp ASC, log_index ASC
-    LIMIT 1 BY id
   `
-  return query<FeeRefundRow>(sql)
+  return dedupeById(await query<FeeRefundRow>(sql))
 }
 
 async function getFeeWithdrawals(wallet: string, endTs?: number): Promise<FeeWithdrawalRow[]> {
@@ -651,9 +655,8 @@ async function getFeeWithdrawals(wallet: string, endTs?: number): Promise<FeeWit
     WHERE \`to\` = '${w}'
     ${timeFilter}
     ORDER BY block_timestamp ASC, log_index ASC
-    LIMIT 1 BY id
   `
-  return query<FeeWithdrawalRow>(sql)
+  return dedupeById(await query<FeeWithdrawalRow>(sql))
 }
 
 async function getAllConditions(): Promise<ConditionRow[]> {
