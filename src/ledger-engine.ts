@@ -516,6 +516,53 @@ function dedupeById<T extends { id: string }>(rows: T[]): T[] {
   return out
 }
 
+async function pagedWalletQuery<T extends { id: string; block_timestamp: string; log_index: number }>(
+  baseSql: string,
+  batchSize = 50_000
+): Promise<T[]> {
+  let cursor: { ts: string; logIndex: number; id: string } | null = null
+  const rows: T[] = []
+
+  while (true) {
+    const cursorFilter: string = cursor
+      ? `
+        AND (
+          block_timestamp > toDateTime64('${cursor.ts}', 3)
+          OR (
+            block_timestamp = toDateTime64('${cursor.ts}', 3)
+            AND (
+              log_index > ${cursor.logIndex}
+              OR (log_index = ${cursor.logIndex} AND id > '${cursor.id}')
+            )
+          )
+        )
+      `
+      : ''
+
+    const sql: string = `
+      ${baseSql}
+      ${cursorFilter}
+      ORDER BY block_timestamp ASC, log_index ASC, id ASC
+      LIMIT ${batchSize}
+    `
+
+    const batch: T[] = await query<T>(sql)
+    if (batch.length === 0) break
+    rows.push(...batch)
+
+    const last: T = batch[batch.length - 1]
+    cursor = {
+      ts: last.block_timestamp,
+      logIndex: Number(last.log_index),
+      id: last.id,
+    }
+
+    if (batch.length < batchSize) break
+  }
+
+  return dedupeById(rows)
+}
+
 async function getTrades(wallet: string, endTs?: number): Promise<TradeRow[]> {
   const w = wallet.toLowerCase()
   const timeFilter = endTs ? `AND block_timestamp <= toDateTime64(${endTs}, 3)` : ''
@@ -524,9 +571,8 @@ async function getTrades(wallet: string, endTs?: number): Promise<TradeRow[]> {
     FROM trades
     WHERE (maker = '${w}' OR taker = '${w}')
     ${timeFilter}
-    ORDER BY block_timestamp ASC, log_index ASC
   `
-  return dedupeById(await query<TradeRow>(sql))
+  return pagedWalletQuery<TradeRow>(sql)
 }
 
 async function getSplits(wallet: string, endTs?: number): Promise<SplitRow[]> {
@@ -537,9 +583,8 @@ async function getSplits(wallet: string, endTs?: number): Promise<SplitRow[]> {
     FROM splits
     WHERE stakeholder = '${w}'
     ${timeFilter}
-    ORDER BY block_timestamp ASC, log_index ASC
   `
-  return dedupeById(await query<SplitRow>(sql))
+  return pagedWalletQuery<SplitRow>(sql)
 }
 
 async function getMerges(wallet: string, endTs?: number): Promise<MergeRow[]> {
@@ -550,9 +595,8 @@ async function getMerges(wallet: string, endTs?: number): Promise<MergeRow[]> {
     FROM merges
     WHERE stakeholder = '${w}'
     ${timeFilter}
-    ORDER BY block_timestamp ASC, log_index ASC
   `
-  return dedupeById(await query<MergeRow>(sql))
+  return pagedWalletQuery<MergeRow>(sql)
 }
 
 async function getRedemptions(wallet: string, endTs?: number): Promise<RedemptionRow[]> {
@@ -563,9 +607,8 @@ async function getRedemptions(wallet: string, endTs?: number): Promise<Redemptio
     FROM redemptions
     WHERE redeemer = '${w}'
     ${timeFilter}
-    ORDER BY block_timestamp ASC, log_index ASC
   `
-  return dedupeById(await query<RedemptionRow>(sql))
+  return pagedWalletQuery<RedemptionRow>(sql)
 }
 
 async function getTransfers(wallet: string, endTs?: number): Promise<TransferRow[]> {
@@ -576,9 +619,8 @@ async function getTransfers(wallet: string, endTs?: number): Promise<TransferRow
     FROM transfers
     WHERE (\`from\` = '${w}' OR \`to\` = '${w}')
     ${timeFilter}
-    ORDER BY block_timestamp ASC, log_index ASC
   `
-  return dedupeById(await query<TransferRow>(sql))
+  return pagedWalletQuery<TransferRow>(sql)
 }
 
 async function getAdapterSplits(wallet: string, endTs?: number): Promise<AdapterSplitRow[]> {
@@ -589,9 +631,8 @@ async function getAdapterSplits(wallet: string, endTs?: number): Promise<Adapter
     FROM adapter_splits
     WHERE stakeholder = '${w}'
     ${timeFilter}
-    ORDER BY block_timestamp ASC, log_index ASC
   `
-  return dedupeById(await query<AdapterSplitRow>(sql))
+  return pagedWalletQuery<AdapterSplitRow>(sql)
 }
 
 async function getAdapterMerges(wallet: string, endTs?: number): Promise<AdapterMergeRow[]> {
@@ -602,9 +643,8 @@ async function getAdapterMerges(wallet: string, endTs?: number): Promise<Adapter
     FROM adapter_merges
     WHERE stakeholder = '${w}'
     ${timeFilter}
-    ORDER BY block_timestamp ASC, log_index ASC
   `
-  return dedupeById(await query<AdapterMergeRow>(sql))
+  return pagedWalletQuery<AdapterMergeRow>(sql)
 }
 
 async function getAdapterRedemptions(wallet: string, endTs?: number): Promise<AdapterRedemptionRow[]> {
@@ -615,9 +655,8 @@ async function getAdapterRedemptions(wallet: string, endTs?: number): Promise<Ad
     FROM adapter_redemptions
     WHERE redeemer = '${w}'
     ${timeFilter}
-    ORDER BY block_timestamp ASC, log_index ASC
   `
-  return dedupeById(await query<AdapterRedemptionRow>(sql))
+  return pagedWalletQuery<AdapterRedemptionRow>(sql)
 }
 
 async function getAdapterConversions(wallet: string, endTs?: number): Promise<AdapterConversionRow[]> {
@@ -628,9 +667,8 @@ async function getAdapterConversions(wallet: string, endTs?: number): Promise<Ad
     FROM adapter_conversions
     WHERE stakeholder = '${w}'
     ${timeFilter}
-    ORDER BY block_timestamp ASC, log_index ASC
   `
-  return dedupeById(await query<AdapterConversionRow>(sql))
+  return pagedWalletQuery<AdapterConversionRow>(sql)
 }
 
 async function getFeeRefunds(wallet: string, endTs?: number): Promise<FeeRefundRow[]> {
@@ -641,9 +679,8 @@ async function getFeeRefunds(wallet: string, endTs?: number): Promise<FeeRefundR
     FROM fee_refunds
     WHERE \`to\` = '${w}'
     ${timeFilter}
-    ORDER BY block_timestamp ASC, log_index ASC
   `
-  return dedupeById(await query<FeeRefundRow>(sql))
+  return pagedWalletQuery<FeeRefundRow>(sql)
 }
 
 async function getFeeWithdrawals(wallet: string, endTs?: number): Promise<FeeWithdrawalRow[]> {
@@ -654,9 +691,8 @@ async function getFeeWithdrawals(wallet: string, endTs?: number): Promise<FeeWit
     FROM fee_withdrawals
     WHERE \`to\` = '${w}'
     ${timeFilter}
-    ORDER BY block_timestamp ASC, log_index ASC
   `
-  return dedupeById(await query<FeeWithdrawalRow>(sql))
+  return pagedWalletQuery<FeeWithdrawalRow>(sql)
 }
 
 async function getAllConditions(): Promise<ConditionRow[]> {
