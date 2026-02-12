@@ -938,7 +938,7 @@ async function handleLeaderboardExplain(url: URL, res: ServerResponse) {
       FROM wallet_trades
       WHERE wallet = {wallet:String}
         ${periodFilter[period]}
-      ORDER BY block_timestamp ASC, tx_hash ASC
+      ORDER BY block_timestamp ASC, id ASC
       LIMIT {limit:UInt32}
     `,
     query_params: { wallet, limit },
