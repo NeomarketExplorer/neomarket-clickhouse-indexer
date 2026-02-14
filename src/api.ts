@@ -13,7 +13,8 @@
  *   GET /trades?tokenId=ID&limit=50&offset=0
  *   GET /market/stats?conditionId=ID (or ?tokenId=ID)
  *   GET /market/candles?conditionId=&tokenId=&interval=1h&from=&to=&limit=500
- *   GET /leaderboard?sort=netCashflow|pnl|volume|trades&limit=20&period=all
+ *   GET /discover/markets?window=1h&limit=20&offset=0&category=&eventId=
+ *   GET /leaderboard?sort=netCashflow|pnl|volume|trades&limit=20&period=all&category=&eventId=
  *   GET /leaderboard/explain?user=ADDRESS&period=all&limit=1000&metric=netCashflow|pnl
  */
 
@@ -47,7 +48,9 @@ function json(res: ServerResponse, status: number, body: unknown) {
 // ── Helpers ──────────────────────────────────────────────────────────
 
 type TokenMeta = {
+  token_id: string
   condition_id: string
+  market_id: string
   question: string
   slug: string
   outcome: string
@@ -56,32 +59,85 @@ type TokenMeta = {
 
 async function getTokenMetaMap(tokenIds: string[]): Promise<Map<string, TokenMeta>> {
   if (tokenIds.length === 0) return new Map()
-  const result = await client.query({
-    query: `
-      SELECT condition_id, question, slug, outcomes, token_ids
-      FROM market_metadata FINAL
-      WHERE hasAny(token_ids, {tokenIds:Array(String)})
-    `,
-    query_params: { tokenIds },
-    format: 'JSONEachRow',
-  })
-  type Row = { condition_id: string; question: string; slug: string; outcomes: string[]; token_ids: string[] }
-  const rows = await result.json() as Row[]
-  const map = new Map<string, TokenMeta>()
-  for (const m of rows) {
-    const tids = Array.isArray(m.token_ids) ? m.token_ids : []
-    const outs = Array.isArray(m.outcomes) ? m.outcomes : []
-    for (let i = 0; i < tids.length; i++) {
-      map.set(tids[i], {
-        condition_id: m.condition_id,
-        question: m.question,
-        slug: m.slug,
-        outcome: outs[i] ?? `Outcome ${i}`,
-        outcome_index: i,
+  // `token_metadata` is derived; keep API functional even if schema isn't deployed yet.
+  try {
+    const result = await client.query({
+      query: `
+        SELECT
+          token_id,
+          condition_id,
+          market_id,
+          question,
+          slug,
+          outcome,
+          outcome_index
+        FROM token_metadata FINAL
+        WHERE token_id IN ({tokenIds:Array(String)})
+      `,
+      query_params: { tokenIds },
+      format: 'JSONEachRow',
+    })
+    type Row = {
+      token_id: string
+      condition_id: string
+      market_id: string
+      question: string
+      slug: string
+      outcome: string
+      outcome_index: number
+    }
+    const rows = await result.json() as Row[]
+    const map = new Map<string, TokenMeta>()
+    for (const r of rows) {
+      map.set(r.token_id, {
+        token_id: r.token_id,
+        condition_id: r.condition_id,
+        market_id: r.market_id,
+        question: r.question,
+        slug: r.slug,
+        outcome: r.outcome,
+        outcome_index: Number(r.outcome_index),
       })
     }
+    return map
+  } catch {
+    const result = await client.query({
+      query: `
+        SELECT condition_id, market_id, question, slug, outcomes, token_ids
+        FROM market_metadata FINAL
+        WHERE hasAny(token_ids, {tokenIds:Array(String)})
+      `,
+      query_params: { tokenIds },
+      format: 'JSONEachRow',
+    })
+    type Row = {
+      condition_id: string
+      market_id: string
+      question: string
+      slug: string
+      outcomes: string[]
+      token_ids: string[]
+    }
+    const rows = await result.json() as Row[]
+    const map = new Map<string, TokenMeta>()
+    for (const m of rows) {
+      const tids = Array.isArray(m.token_ids) ? m.token_ids : []
+      const outs = Array.isArray(m.outcomes) ? m.outcomes : []
+      for (let i = 0; i < tids.length; i++) {
+        if (!tokenIds.includes(tids[i])) continue
+        map.set(tids[i], {
+          token_id: tids[i],
+          condition_id: m.condition_id,
+          market_id: m.market_id,
+          question: m.question,
+          slug: m.slug,
+          outcome: outs[i] ?? `Outcome ${i}`,
+          outcome_index: i,
+        })
+      }
+    }
+    return map
   }
-  return map
 }
 
 async function getTokenIdsForCondition(conditionId: string): Promise<string[]> {
@@ -92,6 +148,95 @@ async function getTokenIdsForCondition(conditionId: string): Promise<string[]> {
   })
   const rows = await result.json() as Array<{ token_ids: string[] }>
   return rows[0]?.token_ids ?? []
+}
+
+type MarketCategories = {
+  condition_id: string
+  market_id: string
+  event_id: string
+  event_title: string
+  event_slug: string
+  categories: string[]
+}
+
+async function getMarketCategoriesMap(conditionIds: string[]): Promise<Map<string, MarketCategories>> {
+  if (conditionIds.length === 0) return new Map()
+  try {
+    const result = await client.query({
+      query: `
+        SELECT
+          condition_id,
+          market_id,
+          event_id,
+          event_title,
+          event_slug,
+          categories
+        FROM market_categories FINAL
+        WHERE condition_id IN ({conditionIds:Array(String)})
+      `,
+      query_params: { conditionIds },
+      format: 'JSONEachRow',
+    })
+    const rows = await result.json() as Array<MarketCategories>
+    return new Map(rows.map((r) => [r.condition_id, {
+      condition_id: r.condition_id,
+      market_id: r.market_id ?? '',
+      event_id: r.event_id ?? '',
+      event_title: r.event_title ?? '',
+      event_slug: r.event_slug ?? '',
+      categories: Array.isArray(r.categories) ? r.categories : [],
+    }]))
+  } catch {
+    return new Map()
+  }
+}
+
+async function getLastPriceMap(tokenIds: string[]): Promise<Map<string, { price: number; timestampMs: number }>> {
+  if (tokenIds.length === 0) return new Map()
+  const result = await client.query({
+    query: `
+      SELECT
+        token_id,
+        argMaxMerge(price_state) AS price,
+        toUnixTimestamp64Milli(argMaxMerge(ts_state)) AS ts_ms
+      FROM token_last_price
+      WHERE token_id IN ({tokenIds:Array(String)})
+      GROUP BY token_id
+    `,
+    query_params: { tokenIds },
+    format: 'JSONEachRow',
+  })
+  const rows = await result.json() as Array<{ token_id: string; price: number; ts_ms: string | number }>
+  const map = new Map<string, { price: number; timestampMs: number }>()
+  for (const r of rows) {
+    map.set(r.token_id, { price: Number(r.price), timestampMs: Number(r.ts_ms ?? 0) })
+  }
+  return map
+}
+
+async function getAvgBuyPriceMap(wallet: string, tokenIds: string[]): Promise<Map<string, number>> {
+  if (tokenIds.length === 0) return new Map()
+  const result = await client.query({
+    query: `
+      SELECT
+        token_id,
+        sum(buy_usd) AS usd,
+        sum(buy_shares) AS shares
+      FROM wallet_token_buys
+      WHERE wallet = {wallet:String}
+        AND token_id IN ({tokenIds:Array(String)})
+      GROUP BY token_id
+    `,
+    query_params: { wallet, tokenIds },
+    format: 'JSONEachRow',
+  })
+  const rows = await result.json() as Array<{ token_id: string; usd: number; shares: number }>
+  const map = new Map<string, number>()
+  for (const r of rows) {
+    const shares = Number(r.shares)
+    map.set(r.token_id, shares > 0 ? Number(r.usd) / shares : 0)
+  }
+  return map
 }
 
 function round2(n: number): number {
@@ -238,6 +383,39 @@ async function queryLeaderboardStatsByWallets(period: LeaderboardPeriod, wallets
   return new Map(rows.map((row) => [row.wallet, row]))
 }
 
+async function queryLeaderboardStatsByWalletsFiltered(
+  period: LeaderboardPeriod,
+  wallets: string[],
+  category: string,
+  eventId: string,
+): Promise<Map<string, LeaderboardRow>> {
+  if (wallets.length === 0) return new Map()
+
+  const result = await client.query({
+    query: `
+      SELECT
+        wt.wallet AS wallet,
+        count() AS totalTrades,
+        sum(toFloat64(wt.usdc_amount)) / 1000000 AS totalVolume,
+        sum(if(wt.side = 'sell', toFloat64(wt.usdc_amount), -toFloat64(wt.usdc_amount))) / 1000000 AS netCashflow,
+        uniqExact(tm.condition_id) AS marketsTraded
+      FROM wallet_trades wt
+      INNER JOIN token_metadata tm ON wt.token_id = tm.token_id
+      INNER JOIN market_categories FINAL mc ON tm.condition_id = mc.condition_id
+      WHERE wt.wallet IN ({wallets:Array(String)})
+        ${leaderboardPeriodFilter(period)}
+        AND ({category:String} = '' OR has(ifNull(mc.categories, []), {category:String}))
+        AND ({eventId:String} = '' OR mc.event_id = {eventId:String})
+      GROUP BY wt.wallet
+    `,
+    query_params: { wallets, category, eventId },
+    format: 'JSONEachRow',
+  })
+
+  const rows = await result.json() as LeaderboardRow[]
+  return new Map(rows.map((row) => [row.wallet, row]))
+}
+
 async function queryLeaderboardRealizedPnl(period: LeaderboardPeriod, limit: number): Promise<LeaderboardRealizedPnlRow[]> {
   const result = await client.query({
     query: `
@@ -252,6 +430,36 @@ async function queryLeaderboardRealizedPnl(period: LeaderboardPeriod, limit: num
       LIMIT {limit:UInt32}
     `,
     query_params: { limit },
+    format: 'JSONEachRow',
+  })
+
+  return await result.json() as LeaderboardRealizedPnlRow[]
+}
+
+async function queryLeaderboardRealizedPnlFiltered(
+  period: LeaderboardPeriod,
+  limit: number,
+  category: string,
+  eventId: string,
+): Promise<LeaderboardRealizedPnlRow[]> {
+  const result = await client.query({
+    query: `
+      SELECT
+        l.wallet AS wallet,
+        sum(l.realized_pnl) AS realizedPnl,
+        count() AS events
+      FROM wallet_ledger FINAL l
+      INNER JOIN market_categories FINAL mc ON l.condition_id = mc.condition_id
+      WHERE l.wallet NOT IN (${LEADERBOARD_EXCLUDED_WALLETS_SQL})
+        ${leaderboardPeriodFilter(period, 'l.block_timestamp')}
+        AND ({category:String} = '' OR has(ifNull(mc.categories, []), {category:String}))
+        AND ({eventId:String} = '' OR mc.event_id = {eventId:String})
+      GROUP BY l.wallet
+      HAVING events >= 5
+      ORDER BY realizedPnl DESC
+      LIMIT {limit:UInt32}
+    `,
+    query_params: { limit, category, eventId },
     format: 'JSONEachRow',
   })
 
@@ -277,6 +485,75 @@ async function queryRealizedPnlForWallets(period: LeaderboardPeriod, wallets: st
 
   const rows = await result.json() as Array<{ wallet: string; realizedPnl: number }>
   return new Map(rows.map((row) => [row.wallet, Number(row.realizedPnl)]))
+}
+
+async function queryRealizedPnlForWalletsFiltered(
+  period: LeaderboardPeriod,
+  wallets: string[],
+  category: string,
+  eventId: string,
+): Promise<Map<string, number>> {
+  if (wallets.length === 0) return new Map()
+
+  const result = await client.query({
+    query: `
+      SELECT
+        l.wallet AS wallet,
+        sum(l.realized_pnl) AS realizedPnl
+      FROM wallet_ledger FINAL l
+      INNER JOIN market_categories FINAL mc ON l.condition_id = mc.condition_id
+      WHERE l.wallet IN ({wallets:Array(String)})
+        ${leaderboardPeriodFilter(period, 'l.block_timestamp')}
+        AND ({category:String} = '' OR has(ifNull(mc.categories, []), {category:String}))
+        AND ({eventId:String} = '' OR mc.event_id = {eventId:String})
+      GROUP BY l.wallet
+    `,
+    query_params: { wallets, category, eventId },
+    format: 'JSONEachRow',
+  })
+
+  const rows = await result.json() as Array<{ wallet: string; realizedPnl: number }>
+  return new Map(rows.map((row) => [row.wallet, Number(row.realizedPnl)]))
+}
+
+async function queryLeaderboardFromRawFiltered(
+  period: LeaderboardPeriod,
+  sort: LeaderboardStatsSort,
+  limit: number,
+  category: string,
+  eventId: string,
+): Promise<LeaderboardRow[]> {
+  const sortCol: Record<string, string> = {
+    netCashflow: 'netCashflow',
+    volume: 'totalVolume',
+    trades: 'totalTrades',
+  }
+
+  const result = await client.query({
+    query: `
+      SELECT
+        wt.wallet AS wallet,
+        count() AS totalTrades,
+        sum(toFloat64(wt.usdc_amount)) / 1000000 AS totalVolume,
+        sum(CASE WHEN wt.side = 'sell' THEN toFloat64(wt.usdc_amount) ELSE -toFloat64(wt.usdc_amount) END) / 1000000 AS netCashflow,
+        uniqExact(tm.condition_id) AS marketsTraded
+      FROM wallet_trades wt
+      INNER JOIN token_metadata tm ON wt.token_id = tm.token_id
+      INNER JOIN market_categories FINAL mc ON tm.condition_id = mc.condition_id
+      WHERE wt.wallet NOT IN (${LEADERBOARD_EXCLUDED_WALLETS_SQL})
+        ${leaderboardPeriodFilter(period)}
+        AND ({category:String} = '' OR has(ifNull(mc.categories, []), {category:String}))
+        AND ({eventId:String} = '' OR mc.event_id = {eventId:String})
+      GROUP BY wt.wallet
+      HAVING totalTrades >= 5
+      ORDER BY ${sortCol[sort]} DESC
+      LIMIT {limit:UInt32}
+    `,
+    query_params: { limit, category, eventId },
+    format: 'JSONEachRow',
+  })
+
+  return await result.json() as LeaderboardRow[]
 }
 
 // ── Existing Handlers ───────────────────────────────────────────────
@@ -418,40 +695,91 @@ async function handlePositions(url: URL, res: ServerResponse) {
 
   const tokenIds = balances.map(b => b.token_id)
 
-  const priceResult = await client.query({
-    query: `
-      SELECT
-        token_id,
-        sum(usdc_amount) / sum(token_amount) AS avg_price
-      FROM wallet_trades
-      WHERE wallet = {wallet:String}
-        AND side = 'buy'
-        AND token_id IN ({tokenIds:Array(String)})
-      GROUP BY token_id
-    `,
-    query_params: { wallet, tokenIds },
-    format: 'JSONEachRow',
-  })
-  const prices = await priceResult.json() as Array<{ token_id: string; avg_price: number }>
-  const priceMap = new Map(prices.map(p => [p.token_id, p.avg_price]))
-
   const metaMap = await getTokenMetaMap(tokenIds)
+  const conditionIds = Array.from(new Set(
+    tokenIds.map(tid => metaMap.get(tid)?.condition_id).filter(Boolean) as string[],
+  ))
 
-  const positions = balances.map(b => {
+  const [avgBuyMap, lastPriceMap, catMap] = await Promise.all([
+    getAvgBuyPriceMap(wallet, tokenIds),
+    getLastPriceMap(tokenIds),
+    getMarketCategoriesMap(conditionIds),
+  ])
+
+  // Backward-compatible fallbacks: these aggregate tables may not be backfilled yet on older deployments.
+  if (avgBuyMap.size < tokenIds.length) {
+    const fallback = await client.query({
+      query: `
+        SELECT
+          token_id,
+          sum(usdc_amount) / sum(token_amount) AS avg_price
+        FROM wallet_trades
+        WHERE wallet = {wallet:String}
+          AND side = 'buy'
+          AND token_id IN ({tokenIds:Array(String)})
+        GROUP BY token_id
+      `,
+      query_params: { wallet, tokenIds },
+      format: 'JSONEachRow',
+    })
+    const rows = await fallback.json() as Array<{ token_id: string; avg_price: number }>
+    for (const r of rows) {
+      if (!avgBuyMap.has(r.token_id)) avgBuyMap.set(r.token_id, Number(r.avg_price) || 0)
+    }
+  }
+
+  if (lastPriceMap.size < tokenIds.length) {
+    const fallback = await client.query({
+      query: `
+        SELECT
+          token_id,
+          argMax(price_per_token, tuple(block_number, log_index)) AS price,
+          toUnixTimestamp64Milli(argMax(block_timestamp, tuple(block_number, log_index))) AS ts_ms
+        FROM trades
+        WHERE token_id IN ({tokenIds:Array(String)})
+        GROUP BY token_id
+      `,
+      query_params: { tokenIds },
+      format: 'JSONEachRow',
+    })
+    const rows = await fallback.json() as Array<{ token_id: string; price: number; ts_ms: string | number }>
+    for (const r of rows) {
+      if (!lastPriceMap.has(r.token_id)) lastPriceMap.set(r.token_id, { price: Number(r.price) || 0, timestampMs: Number(r.ts_ms ?? 0) })
+    }
+  }
+
+  const positions = balances.map((b) => {
     const meta = metaMap.get(b.token_id)
     const size = Number(b.balance) / 1e6
-    const avgPrice = priceMap.get(b.token_id) ?? 0
+
+    const avgPrice = avgBuyMap.get(b.token_id) ?? 0
+    const last = lastPriceMap.get(b.token_id)
+    const currentPrice = last?.price ?? 0
+
     const initialValue = size * avgPrice
+    const currentValue = size * currentPrice
+    const unrealizedPnl = size * (currentPrice - avgPrice)
+
+    const condId = meta?.condition_id ?? ''
+    const cat = condId ? catMap.get(condId) : undefined
+
     return {
       asset: b.token_id,
-      condition_id: meta?.condition_id ?? '',
+      condition_id: condId,
+      market_id: meta?.market_id ?? '',
+      event_id: cat?.event_id ?? '',
+      categories: cat?.categories ?? [],
       outcome: meta?.outcome ?? '',
       outcome_index: meta?.outcome_index ?? 0,
       question: meta?.question ?? '',
       slug: meta?.slug ?? '',
       size,
-      avg_price: avgPrice,
-      initial_value: initialValue,
+      avg_price: round2(avgPrice),
+      current_price: round2(currentPrice),
+      initial_value: round2(initialValue),
+      current_value: round2(currentValue),
+      unrealized_pnl: round2(unrealizedPnl),
+      price_updated_at_ms: last?.timestampMs ?? 0,
     }
   })
 
@@ -737,34 +1065,53 @@ async function handleTrades(url: URL, res: ServerResponse) {
   const limit = Math.min(Math.max(Number(url.searchParams.get('limit') || 50), 1), 200)
   const offset = Math.max(Number(url.searchParams.get('offset') || 0), 0)
 
-  const result = await client.query({
-    query: `
-      SELECT
-        id,
-        toFloat64(usdc_amount) / 1000000 AS value,
-        toFloat64(token_amount) / 1000000 AS size,
-        if(is_taker_buy, 'BUY', 'SELL') AS side,
-        maker,
-        taker,
-        toUnixTimestamp(block_timestamp) AS timestamp,
-        tx_hash,
-        block_number
-      FROM trades
-      WHERE token_id = {tokenId:String}
-      ORDER BY block_timestamp DESC, log_index DESC
-      LIMIT 1 BY id
-      LIMIT {limit:UInt32}
-      OFFSET {offset:UInt32}
-    `,
-    query_params: { tokenId, limit, offset },
-    format: 'JSONEachRow',
-  })
+  // Perf: polymarket.trades is (currently) ordered by id, not token_id/time.
+  // Constrain time by default so the UI doesn't scan years of data to show "recent trades".
+  const now = Math.floor(Date.now() / 1000)
+  const fromParam = url.searchParams.get('from')
+  const toParam = url.searchParams.get('to')
 
-  const rows = await result.json() as Array<{
-    id: string; value: number; size: number; side: string
-    maker: string; taker: string; timestamp: number
-    tx_hash: string; block_number: number
-  }>
+  const defaultLookbackDays = 30
+  const fromTsBase = fromParam ? Math.max(Number(fromParam), 0) : (now - defaultLookbackDays * 86400)
+  const toTs = toParam ? Math.max(Number(toParam), 0) : now
+
+  async function fetchTrades(fromTs: number) {
+    const result = await client.query({
+      query: `
+        SELECT
+          id,
+          toFloat64(usdc_amount) / 1000000 AS value,
+          toFloat64(token_amount) / 1000000 AS size,
+          if(is_taker_buy, 'BUY', 'SELL') AS side,
+          maker,
+          taker,
+          toUnixTimestamp(block_timestamp) AS timestamp,
+          tx_hash,
+          block_number
+        FROM trades
+        PREWHERE token_id = {tokenId:String}
+        WHERE block_timestamp >= toDateTime({fromTs:UInt64})
+          AND block_timestamp <= toDateTime({toTs:UInt64})
+        ORDER BY block_timestamp DESC, log_index DESC
+        LIMIT {limit:UInt32}
+        OFFSET {offset:UInt32}
+      `,
+      query_params: { tokenId, fromTs, toTs, limit, offset },
+      format: 'JSONEachRow',
+    })
+
+    return await result.json() as Array<{
+      id: string; value: number; size: number; side: string
+      maker: string; taker: string; timestamp: number
+      tx_hash: string; block_number: number
+    }>
+  }
+
+  // If the caller didn't specify a time range and the market is illiquid, widen the window.
+  let rows = await fetchTrades(fromTsBase)
+  if (!fromParam && rows.length < Math.min(limit, 10)) {
+    rows = await fetchTrades(now - 365 * 86400)
+  }
 
   const trades = rows.map(r => ({
     id: r.id,
@@ -898,6 +1245,9 @@ async function handleLeaderboard(url: URL, res: ServerResponse) {
   const sort = url.searchParams.get('sort') || 'netCashflow'
   const limit = Math.min(Math.max(Number(url.searchParams.get('limit') || 20), 1), 100)
   const period = (url.searchParams.get('period') || 'all') as LeaderboardPeriod
+  const category = (url.searchParams.get('category') || '').trim()
+  const eventId = (url.searchParams.get('eventId') || '').trim()
+  const isFiltered = category.length > 0 || eventId.length > 0
 
   const validSorts = ['netCashflow', 'pnl', 'volume', 'trades']
   if (!validSorts.includes(sort)) {
@@ -910,14 +1260,22 @@ async function handleLeaderboard(url: URL, res: ServerResponse) {
   }
 
   if (sort === 'pnl') {
-    const pnlRows = await queryLeaderboardRealizedPnl(period, limit)
+    const pnlRows = isFiltered
+      ? await queryLeaderboardRealizedPnlFiltered(period, limit, category, eventId)
+      : await queryLeaderboardRealizedPnl(period, limit)
     const wallets = pnlRows.map((row) => row.wallet)
-    const statsByWallet = await queryLeaderboardStatsByWallets(period, wallets)
+    const statsByWallet = isFiltered
+      ? await queryLeaderboardStatsByWalletsFiltered(period, wallets, category, eventId)
+      : await queryLeaderboardStatsByWallets(period, wallets)
 
     json(res, 200, {
       period,
       sort,
       sortNormalized: 'pnl',
+      filters: {
+        category: category || null,
+        eventId: eventId || null,
+      },
       updatedAt: Math.floor(Date.now() / 1000),
       metric: {
         id: LEADERBOARD_PNL_METRIC_ID,
@@ -951,17 +1309,23 @@ async function handleLeaderboard(url: URL, res: ServerResponse) {
   const normalizedSort = sort as LeaderboardStatsSort
 
   let rows: LeaderboardRow[] = []
-  try {
-    rows = await queryLeaderboardFromMaterialized(period, normalizedSort, limit)
-    if (rows.length === 0) {
-      throw new Error('materialized leaderboard returned no rows')
+  if (isFiltered) {
+    rows = await queryLeaderboardFromRawFiltered(period, normalizedSort, limit, category, eventId)
+  } else {
+    try {
+      rows = await queryLeaderboardFromMaterialized(period, normalizedSort, limit)
+      if (rows.length === 0) {
+        throw new Error('materialized leaderboard returned no rows')
+      }
+    } catch (error) {
+      console.warn('[leaderboard] materialized query failed; falling back to raw query', error)
+      rows = await queryLeaderboardFromRaw(period, normalizedSort, limit)
     }
-  } catch (error) {
-    console.warn('[leaderboard] materialized query failed; falling back to raw query', error)
-    rows = await queryLeaderboardFromRaw(period, normalizedSort, limit)
   }
 
-  const realizedPnlByWallet = await queryRealizedPnlForWallets(period, rows.map((row) => row.wallet))
+  const realizedPnlByWallet = isFiltered
+    ? await queryRealizedPnlForWalletsFiltered(period, rows.map((row) => row.wallet), category, eventId)
+    : await queryRealizedPnlForWallets(period, rows.map((row) => row.wallet))
   const realizedCoverage = rows.length > 0
     ? round2((rows.filter((row) => realizedPnlByWallet.has(row.wallet)).length / rows.length) * 100)
     : 0
@@ -970,6 +1334,10 @@ async function handleLeaderboard(url: URL, res: ServerResponse) {
     period,
     sort,
     sortNormalized: normalizedSort,
+    filters: {
+      category: category || null,
+      eventId: eventId || null,
+    },
     updatedAt: Math.floor(Date.now() / 1000),
     metric: {
       id: LEADERBOARD_CASHFLOW_METRIC_ID,
@@ -1303,16 +1671,17 @@ async function handleMarketCandles(url: URL, res: ServerResponse) {
     }
     query = `
       SELECT
-        toUnixTimestamp(toStartOfInterval(time, ${intervalSql[interval]})) AS time,
-        argMin(open_price, time) AS open,
+        toUnixTimestamp(bucket) AS time,
+        argMin(open_price, t) AS open,
         max(high_price) AS high,
         min(low_price) AS low,
-        argMax(close_price, time) AS close,
+        argMax(close_price, t) AS close,
         sum(vol) AS volume,
         sum(trade_count) AS trades
       FROM (
         SELECT
-          time,
+          time AS t,
+          toStartOfInterval(time, ${intervalSql[interval]}) AS bucket,
           argMinMerge(open) AS open_price,
           maxMerge(high) AS high_price,
           minMerge(low) AS low_price,
@@ -1325,8 +1694,8 @@ async function handleMarketCandles(url: URL, res: ServerResponse) {
           AND time <= toDateTime({toTs:UInt64})
         GROUP BY time
       )
-      GROUP BY time
-      ORDER BY time ASC
+      GROUP BY bucket
+      ORDER BY bucket ASC
       LIMIT {limit:UInt32}
     `
   }
@@ -1341,20 +1710,95 @@ async function handleMarketCandles(url: URL, res: ServerResponse) {
     time: number; open: number; high: number; low: number; close: number; volume: number; trades: number
   }>
 
-  json(res, 200, {
-    conditionId: resolvedConditionId,
-    tokenId,
-    interval,
-    candles: candles.map(c => ({
-      time: c.time,
-      open: round2(c.open),
-      high: round2(c.high),
-      low: round2(c.low),
-      close: round2(c.close),
-      volume: round2(c.volume),
-      trades: Number(c.trades),
-    })),
+	  json(res, 200, {
+	    conditionId: resolvedConditionId,
+	    tokenId,
+	    interval,
+	    candles: candles.map(c => ({
+	      time: c.time,
+	      // Do not round prices here; rounding can turn real red/green candles into dojis.
+	      open: c.open,
+	      high: c.high,
+	      low: c.low,
+	      close: c.close,
+	      volume: round2(c.volume),
+	      trades: Number(c.trades),
+	    })),
+	  })
+	}
+
+// ── Discovery (Trending/Volume Windows) ──────────────────────────────
+//
+// Frontend expects an array (or `{data: [...]}`), not a nested `{markets: ...}` object.
+// This implementation uses existing prod tables: `candles_1m` + `market_metadata`.
+// Category/event filters are accepted but not enforced until taxonomy is synced into ClickHouse.
+
+async function handleDiscoverMarkets(url: URL, res: ServerResponse) {
+  const window = (url.searchParams.get('window') || '24h').trim()
+  const limitRaw = Number(url.searchParams.get('limit') || 20)
+  const offsetRaw = Number(url.searchParams.get('offset') || 0)
+
+  const limit = Number.isFinite(limitRaw) ? Math.max(1, Math.min(200, Math.floor(limitRaw))) : 20
+  const offset = Number.isFinite(offsetRaw) ? Math.max(0, Math.floor(offsetRaw)) : 0
+
+  const intervalSql: Record<string, string> = {
+    '1h': 'INTERVAL 1 HOUR',
+    '3h': 'INTERVAL 3 HOUR',
+    '6h': 'INTERVAL 6 HOUR',
+    '12h': 'INTERVAL 12 HOUR',
+    '24h': 'INTERVAL 24 HOUR',
+    '7d': 'INTERVAL 7 DAY',
+  }
+
+  if (!intervalSql[window]) {
+    json(res, 400, { error: `Invalid window. Use one of: ${Object.keys(intervalSql).join(', ')}` })
+    return
+  }
+
+  const result = await client.query({
+    query: `
+      SELECT
+        condition_id AS marketId,
+        any(question) AS question,
+        any(outcomes) AS outcomes,
+        arrayMap(x -> x.2, arraySort(groupArray((idx, price)))) AS outcomePrices,
+        sum(ifNull(vol, 0.0)) AS volumeUsd
+      FROM (
+        SELECT
+          condition_id,
+          question,
+          outcomes,
+          token_id,
+          idx
+        FROM market_metadata FINAL
+        ARRAY JOIN token_ids AS token_id, arrayEnumerate(token_ids) AS idx
+      ) mm
+      LEFT JOIN (
+        SELECT
+          token_id,
+          argMaxMerge(close) AS price
+        FROM candles_1m
+        WHERE time >= now() - INTERVAL 14 DAY
+        GROUP BY token_id
+      ) p USING (token_id)
+      LEFT JOIN (
+        SELECT
+          token_id,
+          sumMerge(volume) AS vol
+        FROM candles_1m
+        WHERE time >= now() - ${intervalSql[window]}
+        GROUP BY token_id
+      ) v USING (token_id)
+      GROUP BY condition_id
+      ORDER BY volumeUsd DESC
+      LIMIT {limit:UInt32} OFFSET {offset:UInt32}
+    `,
+    query_params: { limit, offset },
+    format: 'JSONEachRow',
   })
+
+  const rows = await result.json()
+  json(res, 200, rows)
 }
 
 // ── Router ──────────────────────────────────────────────────────────
@@ -1387,6 +1831,7 @@ const server = createServer(async (req, res) => {
     if (pathname === '/trades') { await handleTrades(url, res); return }
     if (pathname === '/market/stats') { await handleMarketStats(url, res); return }
     if (pathname === '/market/candles') { await handleMarketCandles(url, res); return }
+    if (pathname === '/discover/markets') { await handleDiscoverMarkets(url, res); return }
     if (pathname === '/leaderboard/explain') { await handleLeaderboardExplain(url, res); return }
     if (pathname === '/leaderboard') { await handleLeaderboard(url, res); return }
 

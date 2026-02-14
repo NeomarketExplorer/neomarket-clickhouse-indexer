@@ -20,6 +20,7 @@
     "reconcile": "tsx src/reconcile-balances.ts",
     "api": "tsx src/api.ts",
     "sync:metadata": "tsx src/sync-metadata.ts",
+    "sync:indexer-metadata": "tsx src/sync-indexer-metadata.ts",
     "audit:leaderboard": "node --import tsx src/leaderboard-audit-agent.ts"
   },
   "dependencies": {

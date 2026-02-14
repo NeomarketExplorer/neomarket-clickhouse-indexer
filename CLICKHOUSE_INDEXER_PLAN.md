@@ -36,6 +36,7 @@ Deployed on Coolify (Hetzner 138.201.57.139). Indexer synced, API live with 12 e
 | Filter contract addresses from leaderboard | Done |
 | Return full structure for empty market/stats | Done |
 | `/market/candles` OHLCV endpoint for price charts | Done |
+| `/market/candles` performance: `candles_1m` AggregatingMergeTree + MV | Done |
 
 ### Repo
 
@@ -58,7 +59,8 @@ Deployed on Coolify (Hetzner 138.201.57.139). Indexer synced, API live with 12 e
 
 ## Future Improvements
 
-1. **CLOB price caching** -- Periodically fetch midpoint prices for more accurate portfolio valuation
+1. **RPC stability** -- Replace `polygon-rpc.com` with `polygon.drpc.org` (current RPC returns garbage on rate limit, causing indexer crash loop)
+2. **CLOB price caching** -- Periodically fetch midpoint prices for more accurate portfolio valuation
 2. **Automatic build-ledger** -- Run build-ledger for active wallets automatically (currently manual per-wallet)
 3. **Leaderboard materialized view** -- Pre-compute leaderboard data for faster queries on `all` period
 4. **winRate in leaderboard** -- Requires wallet_ledger data per user

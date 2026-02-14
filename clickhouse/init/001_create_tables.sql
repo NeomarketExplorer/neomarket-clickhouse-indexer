@@ -34,7 +34,10 @@ CREATE TABLE IF NOT EXISTS polymarket.trades
     price_per_token Float64,-- USDC per token (6 decimals normalized)
 
     -- Hot/cold tracking
-    height UInt64
+    height UInt64,
+
+    -- Data skipping: critical for token-scoped queries since the table is not ordered by token_id.
+    INDEX idx_token_id token_id TYPE bloom_filter(0.01) GRANULARITY 64
 )
 ENGINE = ReplacingMergeTree()
 ORDER BY (id)
@@ -400,23 +403,26 @@ WHERE `from` != '0x0000000000000000000000000000000000000000';
 CREATE TABLE IF NOT EXISTS polymarket.candles_1m (
     token_id String,
     time DateTime,
-    open AggregateFunction(argMin, Float64, DateTime64(3)),
+    -- NOTE: block_timestamp has block-level granularity; many trades share the same timestamp.
+    -- Use (block_number, log_index) to deterministically choose first/last trade in the minute.
+    open AggregateFunction(argMin, Float64, Tuple(UInt64, UInt32)),
     high AggregateFunction(max, Float64),
     low AggregateFunction(min, Float64),
-    close AggregateFunction(argMax, Float64, DateTime64(3)),
+    close AggregateFunction(argMax, Float64, Tuple(UInt64, UInt32)),
     volume AggregateFunction(sum, Float64),
     trades AggregateFunction(count)
 ) ENGINE = AggregatingMergeTree()
+PARTITION BY toYYYYMM(time)
 ORDER BY (token_id, time);
 
 CREATE MATERIALIZED VIEW IF NOT EXISTS polymarket.candles_1m_mv TO polymarket.candles_1m AS
 SELECT
     token_id,
     toStartOfMinute(block_timestamp) AS time,
-    argMinState(toFloat64(usdc_amount) / toFloat64(token_amount), block_timestamp) AS open,
+    argMinState(toFloat64(usdc_amount) / toFloat64(token_amount), tuple(block_number, log_index)) AS open,
     maxState(toFloat64(usdc_amount) / toFloat64(token_amount)) AS high,
     minState(toFloat64(usdc_amount) / toFloat64(token_amount)) AS low,
-    argMaxState(toFloat64(usdc_amount) / toFloat64(token_amount), block_timestamp) AS close,
+    argMaxState(toFloat64(usdc_amount) / toFloat64(token_amount), tuple(block_number, log_index)) AS close,
     sumState(toFloat64(usdc_amount) / 1000000) AS volume,
     countState() AS trades
 FROM polymarket.trades
@@ -437,3 +443,117 @@ CREATE TABLE IF NOT EXISTS polymarket.market_metadata (
     updated_at   DateTime DEFAULT now()
 ) ENGINE = ReplacingMergeTree(updated_at)
 ORDER BY condition_id;
+
+-- Normalized token metadata for fast joins (token_id -> condition/market/outcome).
+CREATE TABLE IF NOT EXISTS polymarket.token_metadata (
+    token_id       String,
+    condition_id   String,
+    market_id      String,
+    question       String,
+    slug           String,
+    outcome        String,
+    outcome_index  UInt8,
+    updated_at     DateTime DEFAULT now()
+) ENGINE = ReplacingMergeTree(updated_at)
+ORDER BY token_id;
+
+CREATE MATERIALIZED VIEW IF NOT EXISTS polymarket.token_metadata_mv
+TO polymarket.token_metadata
+POPULATE
+AS
+SELECT
+    z.1 AS token_id,
+    condition_id,
+    market_id,
+    question,
+    slug,
+    z.2 AS outcome,
+    toUInt8(z.3 - 1) AS outcome_index,
+    updated_at
+FROM polymarket.market_metadata
+ARRAY JOIN arrayZip(token_ids, outcomes, arrayEnumerate(token_ids)) AS z;
+
+-- Event/category enrichment from the Postgres indexer (synced separately).
+CREATE TABLE IF NOT EXISTS polymarket.market_categories (
+    condition_id String,
+    market_id    String,
+    event_id     String,
+    event_title  String,
+    event_slug   String,
+    categories   Array(String),
+    updated_at   DateTime DEFAULT now()
+) ENGINE = ReplacingMergeTree(updated_at)
+ORDER BY condition_id;
+
+-- Last traded price per token (for portfolio/positions "current price").
+CREATE TABLE IF NOT EXISTS polymarket.token_last_price (
+    token_id String,
+    price_state AggregateFunction(argMax, Float64, Tuple(UInt64, UInt32)),
+    ts_state    AggregateFunction(argMax, DateTime64(3), Tuple(UInt64, UInt32))
+) ENGINE = AggregatingMergeTree()
+ORDER BY token_id;
+
+CREATE MATERIALIZED VIEW IF NOT EXISTS polymarket.token_last_price_mv
+TO polymarket.token_last_price
+AS
+SELECT
+    token_id,
+    argMaxState(price_per_token, tuple(block_number, log_index)) AS price_state,
+    argMaxState(block_timestamp, tuple(block_number, log_index)) AS ts_state
+FROM polymarket.trades
+WHERE token_amount > 0
+GROUP BY token_id;
+
+-- Rolling per-token volume by hour. Used for discovery ranking windows (1h/3h/6h/12h/24h).
+CREATE TABLE IF NOT EXISTS polymarket.token_volume_1h (
+    token_id    String,
+    hour        DateTime,
+    volume_usd  Float64,
+    trades      UInt32
+) ENGINE = SummingMergeTree()
+PARTITION BY toYYYYMM(hour)
+ORDER BY (token_id, hour);
+
+CREATE MATERIALIZED VIEW IF NOT EXISTS polymarket.token_volume_1h_mv
+TO polymarket.token_volume_1h
+AS
+SELECT
+    token_id,
+    toStartOfHour(block_timestamp) AS hour,
+    sum(toFloat64(usdc_amount) / 1000000) AS volume_usd,
+    toUInt32(count()) AS trades
+FROM polymarket.trades
+GROUP BY token_id, hour;
+
+-- Fast per-wallet buy aggregates (for avg entry price approximations).
+CREATE TABLE IF NOT EXISTS polymarket.wallet_token_buys (
+    wallet     LowCardinality(String),
+    token_id   String,
+    buy_usd    Float64,
+    buy_shares Float64
+) ENGINE = SummingMergeTree()
+ORDER BY (wallet, token_id);
+
+CREATE MATERIALIZED VIEW IF NOT EXISTS polymarket.wallet_token_buys_maker_mv
+TO polymarket.wallet_token_buys
+AS
+SELECT
+    maker AS wallet,
+    token_id,
+    sum(toFloat64(usdc_amount) / 1000000) AS buy_usd,
+    sum(toFloat64(token_amount) / 1000000) AS buy_shares
+FROM polymarket.trades
+WHERE is_maker_buy
+GROUP BY wallet, token_id;
+
+CREATE MATERIALIZED VIEW IF NOT EXISTS polymarket.wallet_token_buys_taker_mv
+TO polymarket.wallet_token_buys
+AS
+SELECT
+    taker AS wallet,
+    token_id,
+    sum(toFloat64(usdc_amount) / 1000000) AS buy_usd,
+    sum(toFloat64(token_amount) / 1000000) AS buy_shares
+FROM polymarket.trades
+WHERE is_taker_buy
+GROUP BY wallet, token_id;

@@ -10,6 +10,12 @@ The Neomarket frontend (Next.js 15) currently depends on 4 external Polymarket A
 
 We need **6 new endpoints** from the ClickHouse API to fill major gaps in the frontend. The frontend will call these through a Next.js proxy at `/api/clickhouse/[...path]` → `http://138.201.57.139:3002`.
 
+## 2026-02 Update (Implemented / In Progress)
+
+- `/positions` now returns `current_price`, `current_value`, and `unrealized_pnl` (computed using `token_last_price` + `wallet_token_buys`).
+- Added `/discover/markets?window=1h|3h|6h|12h|24h&category=&eventId=` for fast trending/volume discovery windows.
+- `/leaderboard` supports optional filters `category` and `eventId` (requires `market_categories` sync from Postgres indexer).
+
 All endpoints should:
 - Return JSON with `Content-Type: application/json`
 - Return `[]` or `{}` (not errors) when no data found for a valid query
@@ -413,7 +419,7 @@ All 7 endpoints are **IMPLEMENTED AND DEPLOYED**.
 | `GET /trades` | DONE | Full on-chain history with maker/taker |
 | `GET /market/stats` | DONE | Supports both `conditionId` and `tokenId` params |
 | `GET /leaderboard` | DONE | Contract addresses filtered out; winRate always null for now |
-| `GET /market/candles` | DONE | OHLCV from on-chain trades, supports 7 intervals, conditionId/tokenId resolution |
+| `GET /market/candles` | DONE | OHLCV from `candles_1m` AggregatingMergeTree (<300ms, was ~6s from raw trades) |
 
 ### Response Conventions
 
