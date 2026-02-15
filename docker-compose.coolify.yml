@@ -40,6 +40,18 @@ services:
     networks:
       - subsquid_poli_default
 
+  indexer-metadata-sync:
+    build: .
+    command: ["bash", "-lc", "npm run sync:indexer-metadata -- --loop"]
+    env_file: /opt/subsquid_poli/.env
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 1G
+    networks:
+      - subsquid_poli_default
+
   snapshotter:
     build: .
     command: ["bash", "-lc", "npm run snapshot:scheduler -- --wallets-file /app/wallets.txt --interval 1d --loop --sleep 3600"]
