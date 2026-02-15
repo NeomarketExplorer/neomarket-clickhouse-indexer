@@ -485,6 +485,66 @@ CREATE TABLE IF NOT EXISTS polymarket.market_categories (
 ) ENGINE = ReplacingMergeTree(updated_at)
 ORDER BY condition_id;
 
+-- Versioned taxonomy history (append-only). Used for "as-traded" classification audits.
+-- We avoid UPDATE-heavy SCD2 writes; valid_to is derived in a view via window functions.
+CREATE TABLE IF NOT EXISTS polymarket.market_categories_history (
+    condition_id      String,
+    market_id         String,
+    event_id          String,
+    event_title       String,
+    event_slug        String,
+    categories        Array(String),
+    primary_category  String,
+    valid_from        DateTime64(3),
+    version           UInt32,
+    updated_at        DateTime64(3)
+) ENGINE = MergeTree()
+PARTITION BY toYYYYMM(valid_from)
+ORDER BY (condition_id, valid_from);
+
+CREATE VIEW IF NOT EXISTS polymarket.market_categories_history_scd2 AS
+SELECT
+    condition_id,
+    market_id,
+    event_id,
+    event_title,
+    event_slug,
+    categories,
+    primary_category,
+    valid_from,
+    leadInFrame(valid_from, 1, toDateTime64('2100-01-01 00:00:00', 3))
+      OVER (PARTITION BY condition_id ORDER BY valid_from ASC) AS valid_to,
+    version,
+    updated_at
+FROM polymarket.market_categories_history;
+
+-- Convenience view for "current classification" (used by API queries).
+CREATE VIEW IF NOT EXISTS polymarket.market_categories_current AS
+SELECT
+    condition_id,
+    market_id,
+    event_id,
+    event_title,
+    event_slug,
+    categories,
+    updated_at
+FROM polymarket.market_categories FINAL;
+
+-- Rollup: realized-only PnL by wallet + condition_id + day (rebuilt by job; no MV to avoid double-counting on re-ledger).
+CREATE TABLE IF NOT EXISTS polymarket.wallet_condition_pnl_1d (
+    wallet            LowCardinality(String),
+    condition_id      String,
+    day               Date,
+    realized_pnl_usd  Float64,
+    volume_usd        Float64,
+    pnl_rows          UInt32,
+    win_rows          UInt32,
+    loss_rows         UInt32,
+    updated_at        DateTime64(3) DEFAULT now64(3)
+) ENGINE = ReplacingMergeTree(updated_at)
+PARTITION BY toYYYYMM(day)
+ORDER BY (wallet, condition_id, day);
+
 -- Last traded price per token (for portfolio/positions "current price").
 CREATE TABLE IF NOT EXISTS polymarket.token_last_price (
     token_id String,

@@ -274,6 +274,14 @@ type LeaderboardRealizedPnlRow = {
   realizedPnl: number
 }
 
+type LeaderboardRealizedPnlRollupRow = {
+  wallet: string
+  realizedPnl: number
+  pnlRows: number
+  winRows: number
+  lossRows: number
+}
+
 type LeaderboardStatsSort = 'netCashflow' | 'volume' | 'trades'
 type LeaderboardSort = LeaderboardStatsSort | 'pnl'
 
@@ -436,6 +444,43 @@ async function queryLeaderboardRealizedPnl(period: LeaderboardPeriod, limit: num
   return await result.json() as LeaderboardRealizedPnlRow[]
 }
 
+function rollupStartDay(period: LeaderboardPeriod): string | null {
+  const ms = Date.now()
+  const dayMs = 86400 * 1000
+  const toDay = (t: number) => new Date(t).toISOString().slice(0, 10)
+
+  if (period === '7d') return toDay(ms - 7 * dayMs)
+  if (period === '30d') return toDay(ms - 30 * dayMs)
+  if (period === 'all') return null
+  // 24h is not well-represented by a day rollup; fall back to wallet_ledger.
+  return null
+}
+
+async function queryLeaderboardRealizedPnlRollup(period: LeaderboardPeriod, limit: number): Promise<LeaderboardRealizedPnlRollupRow[]> {
+  const startDay = rollupStartDay(period)
+  const result = await client.query({
+    query: `
+      SELECT
+        wallet,
+        sum(realized_pnl_usd) AS realizedPnl,
+        sum(toUInt64(pnl_rows)) AS pnlRows,
+        sum(toUInt64(win_rows)) AS winRows,
+        sum(toUInt64(loss_rows)) AS lossRows
+      FROM wallet_condition_pnl_1d FINAL
+      WHERE wallet NOT IN (${LEADERBOARD_EXCLUDED_WALLETS_SQL})
+        AND ({startDay:String} = '' OR day >= toDate({startDay:String}))
+      GROUP BY wallet
+      HAVING pnlRows >= 5
+      ORDER BY realizedPnl DESC
+      LIMIT {limit:UInt32}
+    `,
+    query_params: { limit, startDay: startDay ?? '' },
+    format: 'JSONEachRow',
+  })
+
+  return await result.json() as LeaderboardRealizedPnlRollupRow[]
+}
+
 async function queryLeaderboardRealizedPnlFiltered(
   period: LeaderboardPeriod,
   limit: number,
@@ -464,6 +509,39 @@ async function queryLeaderboardRealizedPnlFiltered(
   })
 
   return await result.json() as LeaderboardRealizedPnlRow[]
+}
+
+async function queryLeaderboardRealizedPnlRollupFiltered(
+  period: LeaderboardPeriod,
+  limit: number,
+  category: string,
+  eventId: string,
+): Promise<LeaderboardRealizedPnlRollupRow[]> {
+  const startDay = rollupStartDay(period)
+  const result = await client.query({
+    query: `
+      SELECT
+        w.wallet AS wallet,
+        sum(w.realized_pnl_usd) AS realizedPnl,
+        sum(toUInt64(w.pnl_rows)) AS pnlRows,
+        sum(toUInt64(w.win_rows)) AS winRows,
+        sum(toUInt64(w.loss_rows)) AS lossRows
+      FROM wallet_condition_pnl_1d FINAL w
+      INNER JOIN market_categories FINAL mc ON w.condition_id = mc.condition_id
+      WHERE w.wallet NOT IN (${LEADERBOARD_EXCLUDED_WALLETS_SQL})
+        AND ({startDay:String} = '' OR w.day >= toDate({startDay:String}))
+        AND ({category:String} = '' OR has(ifNull(mc.categories, []), {category:String}))
+        AND ({eventId:String} = '' OR mc.event_id = {eventId:String})
+      GROUP BY w.wallet
+      HAVING pnlRows >= 5
+      ORDER BY realizedPnl DESC
+      LIMIT {limit:UInt32}
+    `,
+    query_params: { limit, category, eventId, startDay: startDay ?? '' },
+    format: 'JSONEachRow',
+  })
+
+  return await result.json() as LeaderboardRealizedPnlRollupRow[]
 }
 
 async function queryRealizedPnlForWallets(period: LeaderboardPeriod, wallets: string[]): Promise<Map<string, number>> {
@@ -1260,9 +1338,27 @@ async function handleLeaderboard(url: URL, res: ServerResponse) {
   }
 
   if (sort === 'pnl') {
-    const pnlRows = isFiltered
-      ? await queryLeaderboardRealizedPnlFiltered(period, limit, category, eventId)
-      : await queryLeaderboardRealizedPnl(period, limit)
+    let usedRollup = false
+    let pnlRows: Array<LeaderboardRealizedPnlRow | LeaderboardRealizedPnlRollupRow> = []
+
+    // Prefer rollup for periods >= 7d (and all), fall back to wallet_ledger if rollup is empty/unavailable.
+    if (period !== '24h') {
+      try {
+        pnlRows = isFiltered
+          ? await queryLeaderboardRealizedPnlRollupFiltered(period, limit, category, eventId)
+          : await queryLeaderboardRealizedPnlRollup(period, limit)
+        if (pnlRows.length > 0) usedRollup = true
+      } catch (err) {
+        console.warn('[leaderboard] rollup query failed; falling back to wallet_ledger', err)
+      }
+    }
+
+    if (!usedRollup) {
+      pnlRows = isFiltered
+        ? await queryLeaderboardRealizedPnlFiltered(period, limit, category, eventId)
+        : await queryLeaderboardRealizedPnl(period, limit)
+    }
+
     const wallets = pnlRows.map((row) => row.wallet)
     const statsByWallet = isFiltered
       ? await queryLeaderboardStatsByWalletsFiltered(period, wallets, category, eventId)
@@ -1281,15 +1377,24 @@ async function handleLeaderboard(url: URL, res: ServerResponse) {
         id: LEADERBOARD_PNL_METRIC_ID,
         label: 'Realized PnL (USD)',
         isPnl: true,
-        formula: LEADERBOARD_PNL_METRIC_DEFINITION,
+        formula: usedRollup
+          ? 'sum(realized_pnl_usd) from wallet_condition_pnl_1d'
+          : LEADERBOARD_PNL_METRIC_DEFINITION,
         valueField: 'realizedPnlUsd',
         notes: [
-          'Realized PnL is read from wallet_ledger and only includes wallets processed by the ledger/snapshot jobs.',
+          usedRollup
+            ? 'Realized PnL is read from wallet_condition_pnl_1d (derived from wallet_ledger; only includes wallets processed by ledger jobs).'
+            : 'Realized PnL is read from wallet_ledger and only includes wallets processed by the ledger/snapshot jobs.',
           'Net cashflow is still returned for each row as a separate field.',
         ],
       },
       traders: pnlRows.map((row, i) => {
         const stats = statsByWallet.get(row.wallet)
+        const winRows = (row as any).winRows
+        const lossRows = (row as any).lossRows
+        const wr = (typeof winRows === 'number' && typeof lossRows === 'number' && (winRows + lossRows) > 0)
+          ? Math.round((winRows / (winRows + lossRows)) * 1000) / 1000
+          : null
         return {
           rank: i + 1,
           user: row.wallet,
@@ -1298,7 +1403,8 @@ async function handleLeaderboard(url: URL, res: ServerResponse) {
           totalPnl: round2(Number(stats?.netCashflow ?? 0)),
           totalVolume: round2(Number(stats?.totalVolume ?? 0)),
           totalTrades: Number(stats?.totalTrades ?? 0),
-          winRate: null,
+          // Defined as ledger-row win rate: win_rows / (win_rows + loss_rows) for rows with realized_pnl != 0.
+          winRate: usedRollup ? wr : null,
           marketsTraded: Number(stats?.marketsTraded ?? 0),
         }
       }),
@@ -1381,6 +1487,29 @@ async function handleLeaderboardExplain(url: URL, res: ServerResponse) {
     return
   }
 
+  const conditionId = (url.searchParams.get('conditionId') || '').trim()
+  if (conditionId && !/^0x[a-fA-F0-9]{64}$/.test(conditionId)) {
+    json(res, 400, { error: 'Invalid conditionId; expected bytes32 0x...' })
+    return
+  }
+
+  const fromParam = url.searchParams.get('from')
+  const toParam = url.searchParams.get('to')
+  const parseTs = (v: string | null): number | null => {
+    if (!v) return null
+    // Accept unix seconds or ISO date.
+    if (/^\\d+$/.test(v)) return Math.max(Number(v), 0)
+    const d = new Date(v)
+    if (!Number.isFinite(d.getTime())) return null
+    return Math.floor(d.getTime() / 1000)
+  }
+  const fromTs = parseTs(fromParam)
+  const toTs = parseTs(toParam)
+  if ((fromParam && fromTs === null) || (toParam && toTs === null) || (fromTs !== null && toTs !== null && fromTs > toTs)) {
+    json(res, 400, { error: 'Invalid from/to. Use unix seconds or ISO timestamps.' })
+    return
+  }
+
   const metric = url.searchParams.get('metric') || 'netCashflow'
   if (!['netCashflow', 'pnl'].includes(metric)) {
     json(res, 400, { error: 'Invalid metric. Use: netCashflow or pnl' })
@@ -1388,6 +1517,16 @@ async function handleLeaderboardExplain(url: URL, res: ServerResponse) {
   }
 
   const limit = Math.min(Math.max(Number(url.searchParams.get('limit') || 1000), 1), 10000)
+
+  const ledgerTimeFilter = (col: string) => {
+    if (fromTs !== null || toTs !== null) {
+      const parts: string[] = []
+      if (fromTs !== null) parts.push(`AND ${col} >= toDateTime64({fromTs:UInt64}, 3)`)
+      if (toTs !== null) parts.push(`AND ${col} <= toDateTime64({toTs:UInt64}, 3)`)
+      return parts.join('\\n')
+    }
+    return leaderboardPeriodFilter(period, col)
+  }
 
   if (metric === 'pnl') {
     const summaryResult = await client.query({
@@ -1399,9 +1538,10 @@ async function handleLeaderboardExplain(url: URL, res: ServerResponse) {
           uniqExact(token_id) AS marketsTraded
         FROM wallet_ledger FINAL
         WHERE wallet = {wallet:String}
-          ${leaderboardPeriodFilter(period)}
+          ${conditionId ? 'AND condition_id = {conditionId:String}' : ''}
+          ${ledgerTimeFilter('block_timestamp')}
       `,
-      query_params: { wallet },
+      query_params: { wallet, conditionId, fromTs: fromTs ?? 0, toTs: toTs ?? 0 },
       format: 'JSONEachRow',
     })
 
@@ -1427,11 +1567,12 @@ async function handleLeaderboardExplain(url: URL, res: ServerResponse) {
           realized_pnl
         FROM wallet_ledger FINAL
         WHERE wallet = {wallet:String}
-          ${leaderboardPeriodFilter(period)}
+          ${conditionId ? 'AND condition_id = {conditionId:String}' : ''}
+          ${ledgerTimeFilter('block_timestamp')}
         ORDER BY block_timestamp ASC, id ASC
         LIMIT {limit:UInt32}
       `,
-      query_params: { wallet, limit },
+      query_params: { wallet, limit, conditionId, fromTs: fromTs ?? 0, toTs: toTs ?? 0 },
       format: 'JSONEachRow',
     })
 
@@ -1449,8 +1590,30 @@ async function handleLeaderboardExplain(url: URL, res: ServerResponse) {
     }>
 
     let runningRealized = 0
+    let runningConditionShares: number | null = conditionId ? 0 : null
+    let minConditionShares: number | null = conditionId ? 0 : null
+    const warnings: string[] = []
+    if (!conditionId) {
+      warnings.push('No conditionId provided; inventory invariants are not computed.')
+    } else {
+      warnings.push('Inventory is condition-level (sum of token burns/mints); outcome-level inventory is not computed here.')
+    }
+
+    const sharesDeltaForEvent = (eventType: string, qty: number): number => {
+      if (!Number.isFinite(qty) || qty === 0) return 0
+      if (eventType === 'trade_buy' || eventType === 'split' || eventType === 'adapter_split') return qty
+      if (eventType === 'trade_sell' || eventType === 'merge' || eventType === 'adapter_merge' || eventType === 'redemption' || eventType === 'adapter_redemption') return -qty
+      return 0
+    }
+
     const events = rows.map((row) => {
       runningRealized += Number(row.realized_pnl)
+      if (conditionId && runningConditionShares !== null) {
+        runningConditionShares += sharesDeltaForEvent(row.event_type, Number(row.quantity))
+        if (minConditionShares !== null) {
+          minConditionShares = Math.min(minConditionShares, runningConditionShares)
+        }
+      }
       return {
         eventId: row.id,
         txHash: row.tx_hash || row.id.split('-')[0],
@@ -1464,12 +1627,22 @@ async function handleLeaderboardExplain(url: URL, res: ServerResponse) {
         costBasisUsd: round2(Number(row.cost_basis)),
         realizedPnlUsd: round2(Number(row.realized_pnl)),
         runningRealizedPnlUsd: round2(runningRealized),
+        runningConditionShares: runningConditionShares !== null ? round2(runningConditionShares) : null,
       }
     })
+
+    const neverNegativeInventory = (minConditionShares !== null)
+      ? (minConditionShares >= -0.000001)
+      : null
 
     json(res, 200, {
       user: wallet,
       period,
+      filters: {
+        conditionId: conditionId || null,
+        from: fromParam || null,
+        to: toParam || null,
+      },
       metric: {
         id: LEADERBOARD_PNL_METRIC_ID,
         label: 'Realized PnL (USD)',
@@ -1487,6 +1660,11 @@ async function handleLeaderboardExplain(url: URL, res: ServerResponse) {
         marketsTraded: Number(summaryRow?.marketsTraded ?? 0),
         eventCountReturned: events.length,
         eventLimit: limit,
+        invariants: {
+          never_negative_inventory: neverNegativeInventory,
+          end_inventory_matches_user_balances: null,
+          warnings,
+        },
       },
       events,
     })

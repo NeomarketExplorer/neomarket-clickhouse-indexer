@@ -21,6 +21,7 @@
     "api": "tsx src/api.ts",
     "sync:metadata": "tsx src/sync-metadata.ts",
     "sync:indexer-metadata": "tsx src/sync-indexer-metadata.ts",
+    "rollup:1d": "tsx src/build-rollup-1d.ts",
     "audit:leaderboard": "node --import tsx src/leaderboard-audit-agent.ts"
   },
   "dependencies": {
