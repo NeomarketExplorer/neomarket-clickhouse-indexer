@@ -244,17 +244,19 @@ async function syncOnce(): Promise<number> {
 
 async function main() {
   const loop = process.argv.includes('--loop')
-  await syncOnce()
-
   if (loop) {
     console.log(`🔁 Looping every ${Math.round(SYNC_INTERVAL_MS / 1000)}s`)
+    // Never crash the container in loop mode; log and retry.
+    await syncOnce().catch((err) => console.error('Sync failed:', err))
     setInterval(() => {
       syncOnce().catch((err) => console.error('Sync failed:', err))
     }, SYNC_INTERVAL_MS)
-  } else {
-    await ch.close()
-    process.exit(0)
+    return
   }
+
+  await syncOnce()
+  await ch.close()
+  process.exit(0)
 }
 
 main().catch(err => {
