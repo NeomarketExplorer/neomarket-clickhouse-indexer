@@ -99,7 +99,9 @@ async function syncOnce(): Promise<number> {
   console.log(`🔄 Syncing indexer categories → ClickHouse market_categories...${since ? ` (since ${since})` : ''}`)
   const start = Date.now()
 
-  const BATCH = 2000
+  // Keep batches small: ClickHouse HTTP has strict max form-field sizes and
+  // large param arrays can trip "Field value too long".
+  const BATCH = 200
   let offset = 0
   let total = 0
   let maxUpdatedAtIso: string | null = null
