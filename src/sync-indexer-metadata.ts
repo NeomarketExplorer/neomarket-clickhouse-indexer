@@ -105,6 +105,7 @@ async function syncOnce(): Promise<number> {
   let offset = 0
   let total = 0
   let maxUpdatedAtIso: string | null = null
+  let lastCheckpointMs = 0
 
   while (true) {
     const rows = await fetchBatch(offset, BATCH, since)
@@ -225,6 +226,13 @@ async function syncOnce(): Promise<number> {
         values: historyValues,
         format: 'JSONEachRow',
       })
+    }
+
+    // Persist a checkpoint periodically so we don't restart from scratch if the
+    // container is restarted mid-sync.
+    if (maxUpdatedAtIso && (Date.now() - lastCheckpointMs) > 30_000) {
+      await setLastSince(maxUpdatedAtIso)
+      lastCheckpointMs = Date.now()
     }
 
     offset += rows.length
