@@ -42,6 +42,11 @@ function parseJsonArray(val: string | undefined | null): string[] {
   }
 }
 
+function formatDateTime(date: Date): string {
+  const pad = (n: number) => String(n).padStart(2, '0')
+  return `${date.getUTCFullYear()}-${pad(date.getUTCMonth() + 1)}-${pad(date.getUTCDate())} ${pad(date.getUTCHours())}:${pad(date.getUTCMinutes())}:${pad(date.getUTCSeconds())}`
+}
+
 async function fetchGammaMarkets(offset: number, closed: boolean): Promise<GammaMarket[]> {
   const params = new URLSearchParams({
     limit: String(BATCH_SIZE),
@@ -59,6 +64,7 @@ async function fetchGammaMarkets(offset: number, closed: boolean): Promise<Gamma
 async function syncMarkets(closed: boolean): Promise<number> {
   let offset = 0
   let totalSynced = 0
+  const seenAt = formatDateTime(new Date())
 
   while (true) {
     const markets = await fetchGammaMarkets(offset, closed)
@@ -66,15 +72,23 @@ async function syncMarkets(closed: boolean): Promise<number> {
 
     const values = markets
       .filter(m => m.conditionId)
-      .map(m => ({
-        condition_id: m.conditionId,
-        market_id: m.id,
-        question: m.question,
-        slug: m.slug ?? '',
-        outcomes: parseJsonArray(m.outcomes),
-        token_ids: parseJsonArray(m.clobTokenIds),
-        neg_risk: false,
-      }))
+      .map(m => {
+        const isClosed = (m.closed !== undefined) ? Boolean(m.closed) : closed
+        const isActive = (m.active !== undefined) ? Boolean(m.active) : !isClosed
+        return {
+          condition_id: m.conditionId,
+          market_id: m.id,
+          question: m.question,
+          slug: m.slug ?? '',
+          outcomes: parseJsonArray(m.outcomes),
+          token_ids: parseJsonArray(m.clobTokenIds),
+          neg_risk: false,
+          is_active: isActive,
+          is_closed: isClosed,
+          // Markets seen in the "closed=false" feed are considered currently live.
+          last_seen_open_at: (!isClosed && isActive) ? seenAt : '1970-01-01 00:00:00',
+        }
+      })
 
     if (values.length > 0) {
       await ch.insert({
@@ -104,10 +118,10 @@ async function syncMetadata(): Promise<number> {
   console.log('🔄 Syncing market metadata from Gamma API → ClickHouse...')
   const startTime = Date.now()
 
-  // Sync open markets (changes frequently)
+  // Sync open markets every run. This drives discovery's "live" filter.
   const openCount = await syncMarkets(false)
 
-  // Sync closed markets (only on first run or if very few in DB)
+  // Sync closed markets on first run (warmup of historical metadata labels).
   const countResult = await ch.query({
     query: 'SELECT count() AS c FROM market_metadata',
     format: 'JSONEachRow',
@@ -115,7 +129,6 @@ async function syncMetadata(): Promise<number> {
   const [{ c }] = await countResult.json() as [{ c: string }]
   let closedCount = 0
   if (Number(c) < 10000) {
-    // First sync or very few markets — also sync closed ones
     console.log('  ... also syncing closed markets (first run)')
     closedCount = await syncMarkets(true)
   }

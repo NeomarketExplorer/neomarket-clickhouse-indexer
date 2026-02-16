@@ -440,6 +440,9 @@ CREATE TABLE IF NOT EXISTS polymarket.market_metadata (
     outcomes     Array(String),
     token_ids    Array(String),
     neg_risk     Bool DEFAULT false,
+    is_active    Bool DEFAULT true,
+    is_closed    Bool DEFAULT false,
+    last_seen_open_at DateTime DEFAULT toDateTime(0),
     updated_at   DateTime DEFAULT now()
 ) ENGINE = ReplacingMergeTree(updated_at)
 ORDER BY condition_id;

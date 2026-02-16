@@ -1913,6 +1913,8 @@ async function handleMarketCandles(url: URL, res: ServerResponse) {
 
 async function handleDiscoverMarkets(url: URL, res: ServerResponse) {
   const window = (url.searchParams.get('window') || '24h').trim()
+  const category = (url.searchParams.get('category') || '').trim()
+  const eventId = (url.searchParams.get('eventId') || '').trim()
   const limitRaw = Number(url.searchParams.get('limit') || 20)
   const offsetRaw = Number(url.searchParams.get('offset') || 0)
 
@@ -1933,14 +1935,16 @@ async function handleDiscoverMarkets(url: URL, res: ServerResponse) {
     return
   }
 
+  const hasFilters = category.length > 0 || eventId.length > 0
+
   const result = await client.query({
     query: `
       SELECT
-        condition_id AS marketId,
-        any(question) AS question,
-        any(outcomes) AS outcomes,
-        arrayMap(x -> x.2, arraySort(groupArray((idx, price)))) AS outcomePrices,
-        sum(ifNull(vol, 0.0)) AS volumeUsd
+        mm.condition_id AS marketId,
+        any(mm.question) AS question,
+        any(mm.outcomes) AS outcomes,
+        arrayMap(x -> x.2, arraySort(groupArray((mm.idx, ifNull(p.price, 0.0))))) AS outcomePrices,
+        sum(ifNull(v.vol, 0.0)) AS volumeUsd
       FROM (
         SELECT
           condition_id,
@@ -1950,6 +1954,9 @@ async function handleDiscoverMarkets(url: URL, res: ServerResponse) {
           idx
         FROM market_metadata FINAL
         ARRAY JOIN token_ids AS token_id, arrayEnumerate(token_ids) AS idx
+        WHERE is_active = 1
+          AND is_closed = 0
+          AND last_seen_open_at >= now() - INTERVAL 30 MINUTE
       ) mm
       LEFT JOIN (
         SELECT
@@ -1967,18 +1974,22 @@ async function handleDiscoverMarkets(url: URL, res: ServerResponse) {
         WHERE time >= now() - ${intervalSql[window]}
         GROUP BY token_id
       ) v USING (token_id)
-      GROUP BY condition_id
+      ${hasFilters ? 'INNER JOIN market_categories FINAL mc ON mm.condition_id = mc.condition_id' : ''}
+      WHERE 1 = 1
+        ${hasFilters ? `AND ({category:String} = '' OR has(ifNull(mc.categories, []), {category:String}))
+        AND ({eventId:String} = '' OR mc.event_id = {eventId:String})` : ''}
+      GROUP BY mm.condition_id
+      HAVING volumeUsd > 0
       ORDER BY volumeUsd DESC
       LIMIT {limit:UInt32} OFFSET {offset:UInt32}
     `,
-    query_params: { limit, offset },
+    query_params: { limit, offset, category, eventId },
     format: 'JSONEachRow',
   })
 
   const rows = await result.json()
   json(res, 200, rows)
 }
-
 // ── Router ──────────────────────────────────────────────────────────
 
 const server = createServer(async (req, res) => {
