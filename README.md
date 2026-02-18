@@ -4,7 +4,7 @@ Subsquid + ClickHouse pipeline for Polymarket PnL and position tracking.
 
 **Repo:** https://github.com/NeomarketExplorer/neomarket-clickhouse-indexer
 
-## Status (Feb 9, 2026)
+## Status (Feb 17, 2026)
 
 - **Deployed on Coolify** (Hetzner 138.201.57.139)
 - **Indexer synced** -- processing live blocks (~82.7M+)
@@ -20,6 +20,7 @@ Subsquid + ClickHouse pipeline for Polymarket PnL and position tracking.
 | indexer | `npm run start` | -- | 4G |
 | api | `npm run api` | 3002 | 2G |
 | metadata-sync | `npm run sync:metadata -- --loop` | -- | 1G |
+| indexer-metadata-sync | `npm run sync:indexer-metadata -- --loop` | -- | 1G |
 | snapshotter | `npm run snapshot:scheduler` | -- | 4G (optional, `worker` profile) |
 
 ## API Endpoints (`src/api.ts`)
@@ -45,7 +46,8 @@ Subsquid + ClickHouse pipeline for Polymarket PnL and position tracking.
 | `GET /market/stats?conditionId=` or `?tokenId=` | Market analytics: traders, volume, holders |
 | `GET /market/candles?conditionId=&tokenId=&interval=&from=&to=&limit=` | OHLCV candles for price charts |
 | `GET /leaderboard?sort=&limit=&period=` | Trader rankings by **net cashflow**, **realized PnL** (ledger-backed), volume, or trades |
-| `GET /leaderboard/explain?user=&period=&limit=&metric=` | Audit breakdown (with tx hashes) for `metric=netCashflow` or `metric=pnl` |
+| `GET /leaderboard/explain?user=&period=&limit=&metric=&conditionId=&from=&to=` | Audit breakdown (with tx hashes), optional condition/time filters |
+| `GET /discover/markets?window=&limit=&offset=&category=&eventId=` | Trending/live discovery feed (ClickHouse, live-only) |
 
 ### Data Availability
 
@@ -62,6 +64,7 @@ Subsquid + ClickHouse pipeline for Polymarket PnL and position tracking.
 - `/leaderboard?sort=pnl` ranks by realized PnL from `wallet_ledger` (coverage depends on ledger/snapshot jobs)
 - Leaderboard rows now include both `netCashflowUsd` and `realizedPnlUsd` (when available)
 - Legacy leaderboard field `totalPnl` is retained for compatibility and equals `netCashflowUsd`
+- Discovery feed is filtered to live/tradable markets (`is_active=1`, `is_closed=0`, recent `last_seen_open_at`)
 
 ## Environment Variables
 
@@ -88,6 +91,8 @@ PROCESSOR_ID=polymarket-pnl
 START_BLOCK=4023686
 PORT=3002
 GAMMA_API_URL=https://gamma-api.polymarket.com
+INDEXER_API_URL=http://138.201.57.139:3005
+INDEXER_INTERNAL_TOKEN=<same as neomarket-indexer INTERNAL_API_TOKEN>
 ```
 
 - `RPC_ENDPOINTS` is a comma-separated fallback list. The indexer probes endpoints at startup and picks the first healthy one.
