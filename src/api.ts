@@ -13,8 +13,8 @@
  *   GET /trades?tokenId=ID&limit=50&offset=0
  *   GET /market/stats?conditionId=ID (or ?tokenId=ID)
  *   GET /market/candles?conditionId=&tokenId=&interval=1h&from=&to=&limit=500
- *   GET /discover/markets?window=1h&limit=20&offset=0&category=&eventId=
- *   GET /leaderboard?sort=netCashflow|pnl|volume|trades&limit=20&period=all&category=&eventId=
+ *   GET /discover/markets?window=1h&limit=20&offset=0&category=&eventId= (eventId accepts ID or event slug)
+ *   GET /leaderboard?sort=netCashflow|pnl|volume|trades&limit=20&period=all&category=&eventId= (eventId accepts ID or event slug)
  *   GET /leaderboard/explain?user=ADDRESS&period=all&limit=1000&metric=netCashflow|pnl
  */
 
@@ -413,7 +413,7 @@ async function queryLeaderboardStatsByWalletsFiltered(
       WHERE wt.wallet IN ({wallets:Array(String)})
         ${leaderboardPeriodFilter(period)}
         AND ({category:String} = '' OR has(ifNull(mc.categories, []), {category:String}))
-        AND ({eventId:String} = '' OR mc.event_id = {eventId:String})
+        AND ({eventId:String} = '' OR mc.event_id = {eventId:String} OR mc.event_slug = {eventId:String})
       GROUP BY wt.wallet
     `,
     query_params: { wallets, category, eventId },
@@ -498,7 +498,7 @@ async function queryLeaderboardRealizedPnlFiltered(
       WHERE l.wallet NOT IN (${LEADERBOARD_EXCLUDED_WALLETS_SQL})
         ${leaderboardPeriodFilter(period, 'l.block_timestamp')}
         AND ({category:String} = '' OR has(ifNull(mc.categories, []), {category:String}))
-        AND ({eventId:String} = '' OR mc.event_id = {eventId:String})
+        AND ({eventId:String} = '' OR mc.event_id = {eventId:String} OR mc.event_slug = {eventId:String})
       GROUP BY l.wallet
       HAVING events >= 5
       ORDER BY realizedPnl DESC
@@ -531,7 +531,7 @@ async function queryLeaderboardRealizedPnlRollupFiltered(
       WHERE w.wallet NOT IN (${LEADERBOARD_EXCLUDED_WALLETS_SQL})
         AND ({startDay:String} = '' OR w.day >= toDate({startDay:String}))
         AND ({category:String} = '' OR has(ifNull(mc.categories, []), {category:String}))
-        AND ({eventId:String} = '' OR mc.event_id = {eventId:String})
+        AND ({eventId:String} = '' OR mc.event_id = {eventId:String} OR mc.event_slug = {eventId:String})
       GROUP BY w.wallet
       HAVING pnlRows >= 5
       ORDER BY realizedPnl DESC
@@ -583,7 +583,7 @@ async function queryRealizedPnlForWalletsFiltered(
       WHERE l.wallet IN ({wallets:Array(String)})
         ${leaderboardPeriodFilter(period, 'l.block_timestamp')}
         AND ({category:String} = '' OR has(ifNull(mc.categories, []), {category:String}))
-        AND ({eventId:String} = '' OR mc.event_id = {eventId:String})
+        AND ({eventId:String} = '' OR mc.event_id = {eventId:String} OR mc.event_slug = {eventId:String})
       GROUP BY l.wallet
     `,
     query_params: { wallets, category, eventId },
@@ -621,7 +621,7 @@ async function queryLeaderboardFromRawFiltered(
       WHERE wt.wallet NOT IN (${LEADERBOARD_EXCLUDED_WALLETS_SQL})
         ${leaderboardPeriodFilter(period)}
         AND ({category:String} = '' OR has(ifNull(mc.categories, []), {category:String}))
-        AND ({eventId:String} = '' OR mc.event_id = {eventId:String})
+        AND ({eventId:String} = '' OR mc.event_id = {eventId:String} OR mc.event_slug = {eventId:String})
       GROUP BY wt.wallet
       HAVING totalTrades >= 5
       ORDER BY ${sortCol[sort]} DESC
@@ -1977,7 +1977,7 @@ async function handleDiscoverMarkets(url: URL, res: ServerResponse) {
       ${hasFilters ? 'INNER JOIN market_categories FINAL mc ON mm.condition_id = mc.condition_id' : ''}
       WHERE 1 = 1
         ${hasFilters ? `AND ({category:String} = '' OR has(ifNull(mc.categories, []), {category:String}))
-        AND ({eventId:String} = '' OR mc.event_id = {eventId:String})` : ''}
+        AND ({eventId:String} = '' OR mc.event_id = {eventId:String} OR mc.event_slug = {eventId:String})` : ''}
       GROUP BY mm.condition_id
       HAVING volumeUsd > 0
       ORDER BY volumeUsd DESC
