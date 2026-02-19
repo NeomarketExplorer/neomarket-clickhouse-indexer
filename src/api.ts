@@ -409,7 +409,7 @@ async function queryLeaderboardStatsByWalletsFiltered(
         uniqExact(tm.condition_id) AS marketsTraded
       FROM wallet_trades wt
       INNER JOIN token_metadata tm ON wt.token_id = tm.token_id
-      INNER JOIN market_categories FINAL mc ON tm.condition_id = mc.condition_id
+      INNER JOIN (SELECT * FROM market_categories FINAL) AS mc ON tm.condition_id = mc.condition_id
       WHERE wt.wallet IN ({wallets:Array(String)})
         ${leaderboardPeriodFilter(period)}
         AND ({category:String} = '' OR has(ifNull(mc.categories, []), {category:String}))
@@ -494,7 +494,7 @@ async function queryLeaderboardRealizedPnlFiltered(
         sum(l.realized_pnl) AS realizedPnl,
         count() AS events
       FROM wallet_ledger FINAL l
-      INNER JOIN market_categories FINAL mc ON l.condition_id = mc.condition_id
+      INNER JOIN (SELECT * FROM market_categories FINAL) AS mc ON l.condition_id = mc.condition_id
       WHERE l.wallet NOT IN (${LEADERBOARD_EXCLUDED_WALLETS_SQL})
         ${leaderboardPeriodFilter(period, 'l.block_timestamp')}
         AND ({category:String} = '' OR has(ifNull(mc.categories, []), {category:String}))
@@ -527,7 +527,7 @@ async function queryLeaderboardRealizedPnlRollupFiltered(
         sum(toUInt64(w.win_rows)) AS winRows,
         sum(toUInt64(w.loss_rows)) AS lossRows
       FROM wallet_condition_pnl_1d FINAL w
-      INNER JOIN market_categories FINAL mc ON w.condition_id = mc.condition_id
+      INNER JOIN (SELECT * FROM market_categories FINAL) AS mc ON w.condition_id = mc.condition_id
       WHERE w.wallet NOT IN (${LEADERBOARD_EXCLUDED_WALLETS_SQL})
         AND ({startDay:String} = '' OR w.day >= toDate({startDay:String}))
         AND ({category:String} = '' OR has(ifNull(mc.categories, []), {category:String}))
@@ -579,7 +579,7 @@ async function queryRealizedPnlForWalletsFiltered(
         l.wallet AS wallet,
         sum(l.realized_pnl) AS realizedPnl
       FROM wallet_ledger FINAL l
-      INNER JOIN market_categories FINAL mc ON l.condition_id = mc.condition_id
+      INNER JOIN (SELECT * FROM market_categories FINAL) AS mc ON l.condition_id = mc.condition_id
       WHERE l.wallet IN ({wallets:Array(String)})
         ${leaderboardPeriodFilter(period, 'l.block_timestamp')}
         AND ({category:String} = '' OR has(ifNull(mc.categories, []), {category:String}))
@@ -617,7 +617,7 @@ async function queryLeaderboardFromRawFiltered(
         uniqExact(tm.condition_id) AS marketsTraded
       FROM wallet_trades wt
       INNER JOIN token_metadata tm ON wt.token_id = tm.token_id
-      INNER JOIN market_categories FINAL mc ON tm.condition_id = mc.condition_id
+      INNER JOIN (SELECT * FROM market_categories FINAL) AS mc ON tm.condition_id = mc.condition_id
       WHERE wt.wallet NOT IN (${LEADERBOARD_EXCLUDED_WALLETS_SQL})
         ${leaderboardPeriodFilter(period)}
         AND ({category:String} = '' OR has(ifNull(mc.categories, []), {category:String}))
@@ -1974,7 +1974,7 @@ async function handleDiscoverMarkets(url: URL, res: ServerResponse) {
         WHERE time >= now() - ${intervalSql[window]}
         GROUP BY token_id
       ) v USING (token_id)
-      ${hasFilters ? 'INNER JOIN market_categories FINAL mc ON mm.condition_id = mc.condition_id' : ''}
+      ${hasFilters ? 'INNER JOIN (SELECT * FROM market_categories FINAL) AS mc ON mm.condition_id = mc.condition_id' : ''}
       WHERE 1 = 1
         ${hasFilters ? `AND ({category:String} = '' OR has(ifNull(mc.categories, []), {category:String}))
         AND ({eventId:String} = '' OR mc.event_id = {eventId:String} OR mc.event_slug = {eventId:String})` : ''}
