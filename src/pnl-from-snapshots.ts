@@ -12,12 +12,13 @@ async function querySnapshot(client: ReturnType<typeof createClient>, wallet: st
     query: `
       SELECT *
       FROM wallet_pnl_snapshots FINAL
-      WHERE wallet = '${wallet.toLowerCase()}'
-        AND snapshot_time <= toDateTime64(${ts}, 3)
+      WHERE wallet = {wallet:String}
+        AND snapshot_time <= toDateTime64({ts:UInt64}, 3)
       ORDER BY snapshot_time DESC
       LIMIT 1
     `,
     format: 'JSONEachRow',
+    query_params: { wallet: wallet.toLowerCase(), ts },
   })
   const rows = await result.json() as Array<{
     snapshot_time: string

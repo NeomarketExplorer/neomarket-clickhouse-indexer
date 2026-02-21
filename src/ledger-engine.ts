@@ -390,8 +390,8 @@ const client = createClient({
   },
 })
 
-async function query<T>(sql: string): Promise<T[]> {
-  const result = await client.query({ query: sql, format: 'JSONEachRow' })
+async function query<T>(sql: string, query_params?: Record<string, unknown>): Promise<T[]> {
+  const result = await client.query({ query: sql, format: 'JSONEachRow', query_params })
   return result.json() as Promise<T[]>
 }
 
@@ -518,6 +518,7 @@ function dedupeById<T extends { id: string }>(rows: T[]): T[] {
 
 async function pagedWalletQuery<T extends { id: string; block_timestamp: string; log_index: number }>(
   baseSql: string,
+  baseParams: Record<string, unknown> = {},
   batchSize = 50_000
 ): Promise<T[]> {
   let cursor: { ts: string; logIndex: number; id: string } | null = null
@@ -527,17 +528,24 @@ async function pagedWalletQuery<T extends { id: string; block_timestamp: string;
     const cursorFilter: string = cursor
       ? `
         AND (
-          block_timestamp > toDateTime64('${cursor.ts}', 3)
+          block_timestamp > toDateTime64({_cursor_ts:String}, 3)
           OR (
-            block_timestamp = toDateTime64('${cursor.ts}', 3)
+            block_timestamp = toDateTime64({_cursor_ts:String}, 3)
             AND (
-              log_index > ${cursor.logIndex}
-              OR (log_index = ${cursor.logIndex} AND id > '${cursor.id}')
+              log_index > {_cursor_logIndex:UInt64}
+              OR (log_index = {_cursor_logIndex:UInt64} AND id > {_cursor_id:String})
             )
           )
         )
       `
       : ''
+
+    const params: Record<string, unknown> = { ...baseParams }
+    if (cursor) {
+      params._cursor_ts = cursor.ts
+      params._cursor_logIndex = cursor.logIndex
+      params._cursor_id = cursor.id
+    }
 
     const sql: string = `
       ${baseSql}
@@ -546,7 +554,7 @@ async function pagedWalletQuery<T extends { id: string; block_timestamp: string;
       LIMIT ${batchSize}
     `
 
-    const batch: T[] = await query<T>(sql)
+    const batch: T[] = await query<T>(sql, params)
     if (batch.length === 0) break
     rows.push(...batch)
 
@@ -565,134 +573,156 @@ async function pagedWalletQuery<T extends { id: string; block_timestamp: string;
 
 async function getTrades(wallet: string, endTs?: number): Promise<TradeRow[]> {
   const w = wallet.toLowerCase()
-  const timeFilter = endTs ? `AND block_timestamp <= toDateTime64(${endTs}, 3)` : ''
+  const timeFilter = endTs ? `AND block_timestamp <= toDateTime64({endTs:UInt64}, 3)` : ''
+  const params: Record<string, unknown> = { wallet: w }
+  if (endTs) params.endTs = endTs
   const sql = `
     SELECT *
     FROM trades
-    WHERE (maker = '${w}' OR taker = '${w}')
+    WHERE (maker = {wallet:String} OR taker = {wallet:String})
     ${timeFilter}
   `
-  return pagedWalletQuery<TradeRow>(sql)
+  return pagedWalletQuery<TradeRow>(sql, params)
 }
 
 async function getSplits(wallet: string, endTs?: number): Promise<SplitRow[]> {
   const w = wallet.toLowerCase()
-  const timeFilter = endTs ? `AND block_timestamp <= toDateTime64(${endTs}, 3)` : ''
+  const timeFilter = endTs ? `AND block_timestamp <= toDateTime64({endTs:UInt64}, 3)` : ''
+  const params: Record<string, unknown> = { wallet: w }
+  if (endTs) params.endTs = endTs
   const sql = `
     SELECT *
     FROM splits
-    WHERE stakeholder = '${w}'
+    WHERE stakeholder = {wallet:String}
     ${timeFilter}
   `
-  return pagedWalletQuery<SplitRow>(sql)
+  return pagedWalletQuery<SplitRow>(sql, params)
 }
 
 async function getMerges(wallet: string, endTs?: number): Promise<MergeRow[]> {
   const w = wallet.toLowerCase()
-  const timeFilter = endTs ? `AND block_timestamp <= toDateTime64(${endTs}, 3)` : ''
+  const timeFilter = endTs ? `AND block_timestamp <= toDateTime64({endTs:UInt64}, 3)` : ''
+  const params: Record<string, unknown> = { wallet: w }
+  if (endTs) params.endTs = endTs
   const sql = `
     SELECT *
     FROM merges
-    WHERE stakeholder = '${w}'
+    WHERE stakeholder = {wallet:String}
     ${timeFilter}
   `
-  return pagedWalletQuery<MergeRow>(sql)
+  return pagedWalletQuery<MergeRow>(sql, params)
 }
 
 async function getRedemptions(wallet: string, endTs?: number): Promise<RedemptionRow[]> {
   const w = wallet.toLowerCase()
-  const timeFilter = endTs ? `AND block_timestamp <= toDateTime64(${endTs}, 3)` : ''
+  const timeFilter = endTs ? `AND block_timestamp <= toDateTime64({endTs:UInt64}, 3)` : ''
+  const params: Record<string, unknown> = { wallet: w }
+  if (endTs) params.endTs = endTs
   const sql = `
     SELECT *
     FROM redemptions
-    WHERE redeemer = '${w}'
+    WHERE redeemer = {wallet:String}
     ${timeFilter}
   `
-  return pagedWalletQuery<RedemptionRow>(sql)
+  return pagedWalletQuery<RedemptionRow>(sql, params)
 }
 
 async function getTransfers(wallet: string, endTs?: number): Promise<TransferRow[]> {
   const w = wallet.toLowerCase()
-  const timeFilter = endTs ? `AND block_timestamp <= toDateTime64(${endTs}, 3)` : ''
+  const timeFilter = endTs ? `AND block_timestamp <= toDateTime64({endTs:UInt64}, 3)` : ''
+  const params: Record<string, unknown> = { wallet: w }
+  if (endTs) params.endTs = endTs
   const sql = `
     SELECT *
     FROM transfers
-    WHERE (\`from\` = '${w}' OR \`to\` = '${w}')
+    WHERE (\`from\` = {wallet:String} OR \`to\` = {wallet:String})
     ${timeFilter}
   `
-  return pagedWalletQuery<TransferRow>(sql)
+  return pagedWalletQuery<TransferRow>(sql, params)
 }
 
 async function getAdapterSplits(wallet: string, endTs?: number): Promise<AdapterSplitRow[]> {
   const w = wallet.toLowerCase()
-  const timeFilter = endTs ? `AND block_timestamp <= toDateTime64(${endTs}, 3)` : ''
+  const timeFilter = endTs ? `AND block_timestamp <= toDateTime64({endTs:UInt64}, 3)` : ''
+  const params: Record<string, unknown> = { wallet: w }
+  if (endTs) params.endTs = endTs
   const sql = `
     SELECT *
     FROM adapter_splits
-    WHERE stakeholder = '${w}'
+    WHERE stakeholder = {wallet:String}
     ${timeFilter}
   `
-  return pagedWalletQuery<AdapterSplitRow>(sql)
+  return pagedWalletQuery<AdapterSplitRow>(sql, params)
 }
 
 async function getAdapterMerges(wallet: string, endTs?: number): Promise<AdapterMergeRow[]> {
   const w = wallet.toLowerCase()
-  const timeFilter = endTs ? `AND block_timestamp <= toDateTime64(${endTs}, 3)` : ''
+  const timeFilter = endTs ? `AND block_timestamp <= toDateTime64({endTs:UInt64}, 3)` : ''
+  const params: Record<string, unknown> = { wallet: w }
+  if (endTs) params.endTs = endTs
   const sql = `
     SELECT *
     FROM adapter_merges
-    WHERE stakeholder = '${w}'
+    WHERE stakeholder = {wallet:String}
     ${timeFilter}
   `
-  return pagedWalletQuery<AdapterMergeRow>(sql)
+  return pagedWalletQuery<AdapterMergeRow>(sql, params)
 }
 
 async function getAdapterRedemptions(wallet: string, endTs?: number): Promise<AdapterRedemptionRow[]> {
   const w = wallet.toLowerCase()
-  const timeFilter = endTs ? `AND block_timestamp <= toDateTime64(${endTs}, 3)` : ''
+  const timeFilter = endTs ? `AND block_timestamp <= toDateTime64({endTs:UInt64}, 3)` : ''
+  const params: Record<string, unknown> = { wallet: w }
+  if (endTs) params.endTs = endTs
   const sql = `
     SELECT *
     FROM adapter_redemptions
-    WHERE redeemer = '${w}'
+    WHERE redeemer = {wallet:String}
     ${timeFilter}
   `
-  return pagedWalletQuery<AdapterRedemptionRow>(sql)
+  return pagedWalletQuery<AdapterRedemptionRow>(sql, params)
 }
 
 async function getAdapterConversions(wallet: string, endTs?: number): Promise<AdapterConversionRow[]> {
   const w = wallet.toLowerCase()
-  const timeFilter = endTs ? `AND block_timestamp <= toDateTime64(${endTs}, 3)` : ''
+  const timeFilter = endTs ? `AND block_timestamp <= toDateTime64({endTs:UInt64}, 3)` : ''
+  const params: Record<string, unknown> = { wallet: w }
+  if (endTs) params.endTs = endTs
   const sql = `
     SELECT *
     FROM adapter_conversions
-    WHERE stakeholder = '${w}'
+    WHERE stakeholder = {wallet:String}
     ${timeFilter}
   `
-  return pagedWalletQuery<AdapterConversionRow>(sql)
+  return pagedWalletQuery<AdapterConversionRow>(sql, params)
 }
 
 async function getFeeRefunds(wallet: string, endTs?: number): Promise<FeeRefundRow[]> {
   const w = wallet.toLowerCase()
-  const timeFilter = endTs ? `AND block_timestamp <= toDateTime64(${endTs}, 3)` : ''
+  const timeFilter = endTs ? `AND block_timestamp <= toDateTime64({endTs:UInt64}, 3)` : ''
+  const params: Record<string, unknown> = { wallet: w }
+  if (endTs) params.endTs = endTs
   const sql = `
     SELECT *
     FROM fee_refunds
-    WHERE \`to\` = '${w}'
+    WHERE \`to\` = {wallet:String}
     ${timeFilter}
   `
-  return pagedWalletQuery<FeeRefundRow>(sql)
+  return pagedWalletQuery<FeeRefundRow>(sql, params)
 }
 
 async function getFeeWithdrawals(wallet: string, endTs?: number): Promise<FeeWithdrawalRow[]> {
   const w = wallet.toLowerCase()
-  const timeFilter = endTs ? `AND block_timestamp <= toDateTime64(${endTs}, 3)` : ''
+  const timeFilter = endTs ? `AND block_timestamp <= toDateTime64({endTs:UInt64}, 3)` : ''
+  const params: Record<string, unknown> = { wallet: w }
+  if (endTs) params.endTs = endTs
   const sql = `
     SELECT *
     FROM fee_withdrawals
-    WHERE \`to\` = '${w}'
+    WHERE \`to\` = {wallet:String}
     ${timeFilter}
   `
-  return pagedWalletQuery<FeeWithdrawalRow>(sql)
+  return pagedWalletQuery<FeeWithdrawalRow>(sql, params)
 }
 
 async function getAllConditions(): Promise<ConditionRow[]> {

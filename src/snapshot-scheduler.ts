@@ -68,17 +68,22 @@ async function processWallet(
 
   const w = wallet.toLowerCase()
   const timeFilterLedger = startTs || endTs
-    ? `AND block_timestamp >= toDateTime64(${startTs ?? 0}, 3) AND block_timestamp <= toDateTime64(${endTs ?? Math.floor(Date.now() / 1000)}, 3)`
+    ? `AND block_timestamp >= toDateTime64({startTs:UInt64}, 3) AND block_timestamp <= toDateTime64({endTs:UInt64}, 3)`
     : ''
   const timeFilterSnapshots = startTs || endTs
-    ? `AND snapshot_time >= toDateTime64(${startTs ?? 0}, 3) AND snapshot_time <= toDateTime64(${endTs ?? Math.floor(Date.now() / 1000)}, 3)`
+    ? `AND snapshot_time >= toDateTime64({startTs:UInt64}, 3) AND snapshot_time <= toDateTime64({endTs:UInt64}, 3)`
     : ''
+  const timeParams = startTs || endTs
+    ? { startTs: startTs ?? 0, endTs: endTs ?? Math.floor(Date.now() / 1000) }
+    : {}
 
   await client.exec({
-    query: `ALTER TABLE wallet_ledger DELETE WHERE wallet = '${w}' ${timeFilterLedger}`,
+    query: `ALTER TABLE wallet_ledger DELETE WHERE wallet = {wallet:String} ${timeFilterLedger}`,
+    query_params: { wallet: w, ...timeParams },
   })
   await client.exec({
-    query: `ALTER TABLE wallet_pnl_snapshots DELETE WHERE wallet = '${w}' ${timeFilterSnapshots}`,
+    query: `ALTER TABLE wallet_pnl_snapshots DELETE WHERE wallet = {wallet:String} ${timeFilterSnapshots}`,
+    query_params: { wallet: w, ...timeParams },
   })
 
   if (ledgerEntries.length > 0) {
